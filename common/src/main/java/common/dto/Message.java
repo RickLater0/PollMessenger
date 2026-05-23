@@ -55,4 +55,13 @@ public class Message implements Serializable {
 	public void setSeenTime(LocalDateTime seenTime) {
 		this.seenTime = seenTime;
 	}
+
+	public String toString(){
+		return "id: " + messageId +
+				" from: " + from.name() +
+				" to: " + to.name() +
+				" dispatch: " + dispatchTime +
+				" seen: " + seenTime +
+				" content: " + content;
+	}
 }

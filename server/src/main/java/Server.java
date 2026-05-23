@@ -19,6 +19,7 @@ public final class Server {
 	private ServerSocket serverSocket;
 	private final List<ClientHandler> activeClients = new CopyOnWriteArrayList<>();
 	private final Map<User, Integer> users = new ConcurrentHashMap<>();
+	private final Map<Integer, User> usersReverse = new ConcurrentHashMap<>();
 	private final Map<User, BlockingQueue<Message>> messageQueues = new ConcurrentHashMap<>();
 
 	private Connection connection;
@@ -129,14 +130,30 @@ public final class Server {
 								}
 							}
 							out.flush();
-						} else if (dto instanceof MarkAsSeenRequest(long messageId)) {
+						} else if (dto instanceof MarkAsSeenRequest(long messageId, User chatter)) {
 							if (!isAuthorised) {
 								out.writeObject(new ErrorMessage("Error: User not authorised"));
+								out.flush();
 							} else {
-								markMessageAsSeen(messageId);
+								var msg = markMessageAsSeen(messageId);
+								if (msg != null) {
+									var client = activeClients.stream().
+											filter(cl -> cl.client != null && cl.client.equals(chatter)).
+											findFirst();
+									System.out.println(chatter + " " + client.isPresent());
+									if(client.isPresent()){
+										client.get().sendMessages(List.of(msg));
+										System.out.println("Msg sent");
+									}
+
+								} else {
+									out.writeObject(new GetMessagesResponse(List.of()));
+									out.flush();
+								}
 								out.writeObject(new InfoMessage("Message marked as seen"));
+								out.flush();
 							}
-							out.flush();
+
 						} else if (dto instanceof LogoutRequest) {
 							out.writeObject(new InfoMessage("Logout successful"));
 							out.flush();
@@ -150,18 +167,24 @@ public final class Server {
 				} catch (IOException | ClassNotFoundException e) {
 					System.err.println("Unexpected error in client handler: " + e.getMessage());
 				}
+				finally {
+					if(in != null)
+						in.close();
+
+				}
 			} catch (IOException e) {
 				throw new RuntimeException(e);
 			} finally {
-				try {
-					if(out != null)
+				if(out != null){
+					try {
+						out.flush();
+						out.reset();
 						out.close();
-					if(in != null)
-						in.close();
-				} catch (IOException e) {
-					System.err.println("In/Out streams failed to close: " + e.getMessage());
-				}
+					} catch (IOException e) {
+						System.err.println("Out stream close error" + e.getMessage());
+					}
 
+				}
 				try { if (!clientSocket.isClosed()) clientSocket.close(); } catch (IOException ignored) {}
 				if (client != null) {
 					removeQueueForUser(client);
@@ -174,14 +197,10 @@ public final class Server {
 			return this.client;
 		}
 
-		public void markAsSeen(long messageId){
-			if(out != null){
-				try {
-					out.writeObject(new MarkAsSeenRequest(messageId));
-					out.flush();
-				} catch (IOException e) {
-					throw new RuntimeException(e);
-				}
+		public void sendMessages(List<Message> messages) throws IOException {
+			if(out != null && clientSocket.isConnected()){
+				out.writeObject(new GetMessagesResponse(messages));
+				System.out.println("truly marked");
 			}
 		}
 
@@ -300,7 +319,10 @@ public final class Server {
 					stmt1.setInt(1, serverId);
 					ResultSet rs1 = stmt1.executeQuery();
 					while(rs1.next()){
-						users.put(new User(rs1.getString("username")), rs1.getInt("userId"));
+						var user = new User(rs1.getString("username"));
+						int userId = rs1.getInt("userId");
+						users.put(user, userId);
+						usersReverse.put(userId, user);
 					}
 				}
 			} else {
@@ -326,8 +348,12 @@ public final class Server {
 			int affected = stmt.executeUpdate();
 			if(affected > 0){
 				ResultSet rs = stmt.getGeneratedKeys();
-				if(rs.next())
-					users.put(new User(name), rs.getInt(1));
+				if(rs.next()){
+					var user = new User(name);
+					users.put(user, rs.getInt(1));
+					usersReverse.put(rs.getInt(1), user);
+				}
+
 				return true;
 			}
 		} catch (SQLException e) {
@@ -348,6 +374,7 @@ public final class Server {
 			if(rs.next()){
 				int userId = rs.getInt("userId");
 				users.put(new User(name), userId);
+				usersReverse.put(userId, new User(name));
 				return userId;
 			}
 		}catch (SQLException e) {
@@ -498,15 +525,29 @@ public final class Server {
 		return false;
 	}
 
-
-	private void markMessageAsSeen(long messageId){
-		String sql = "update messages set seenTime = current_timestamp where messageId = ?";
+	private Message markMessageAsSeen(long messageId){
+		String sql = "update messages set seenTime = ? where messageId = ? returning *";
 		try(PreparedStatement stmt = connection.prepareStatement(sql)){
-			stmt.setLong(1, messageId);
-			stmt.executeUpdate();
+			stmt.setTimestamp(1, Timestamp.valueOf(LocalDateTime.now()));
+			stmt.setLong(2, messageId);
+			try (ResultSet rs = stmt.executeQuery()) {
+				if (rs.next()) {
+					String content = rs.getString("content");
+					User from = usersReverse.get(rs.getInt("fromUser"));
+					User to = usersReverse.get(rs.getInt("toUser"));
+					LocalDateTime dispatchTime = rs.getTimestamp("dispatchTime").toLocalDateTime();
+					LocalDateTime seenTime = rs.getTimestamp("seenTime").toLocalDateTime();
+					var msg = new Message(messageId, new MessageContent(content), from, to, dispatchTime, seenTime);
+					System.out.println("\n" + msg);
+					return msg;
+				} else {
+					System.out.println("Сообщение с id " + messageId + " не найдено");
+				}
+			}
 		}catch(SQLException e){
 			System.err.println("Couldn't mark message " + messageId + " as seen: " + e.getMessage());
 		}
+		return null;
 	}
 
 	private List<Message> getDialog(User me, User with) {

@@ -118,8 +118,8 @@ public final class Client {
 		}
 	}
 
-	private void markAsSeen(long messageId) throws IOException, ClassNotFoundException {
-		cmdOut.writeObject(new MarkAsSeenRequest(messageId));
+	private void markAsSeen(long messageId, User chatter) throws IOException, ClassNotFoundException {
+		cmdOut.writeObject(new MarkAsSeenRequest(messageId,chatter));
 		cmdOut.flush();
 		Object response = cmdIn.readObject();
 		if (response instanceof ErrorMessage(String message)) {
@@ -171,11 +171,9 @@ public final class Client {
 						for (Message msg : messages) {
 							// Если мы в чате с отправителем
 							if (inChat && activeChatWith != null && activeChatWith.equals(msg.from())) {
-								// Ищем, есть ли уже это сообщение в истории (по messageId)
 								boolean found = false;
 								for (int i = 0; i < currentChatHistory.size(); i++) {
 									if (currentChatHistory.get(i).messageId() == msg.messageId()) {
-										// Обновляем seenTime
 										currentChatHistory.set(i, msg);
 										found = true;
 										break;
@@ -184,13 +182,9 @@ public final class Client {
 								if (!found) {
 									currentChatHistory.add(msg);
 								}
-								// Помечаем как прочитанное на сервере (если ещё не прочитано)
 								if (msg.seenTime() == null) {
-									markAsSeen(msg.messageId());
-									// Обновляем seenTime в локальном объекте (после вызова markAsSeen сервер обновил БД, но нам надо отобразить)
-									// Можно запросить сообщение заново, но проще сразу установить seenTime в текущем объекте,
-									// так как мы знаем, что только что пометили. Однако сервер вернёт это сообщение снова в следующем poll?
-									// Чтобы не ждать, установим время прямо сейчас:
+									markAsSeen(msg.messageId(), activeChatWith);
+
 									for (Message m : currentChatHistory) {
 										if (m.messageId() == msg.messageId() && m.seenTime() == null) {
 											// Создаём копию с текущим временем
@@ -284,11 +278,11 @@ public final class Client {
 			// Отмечаем непрочитанные сообщения от партнёра на сервере
 			for (Message msg : history) {
 				if (msg.from().equals(partner) && msg.seenTime() == null) {
-					markAsSeen(msg.messageId());
+					markAsSeen(msg.messageId(), activeChatWith);
 				}
 			}
 			// Сохраняем историю с уже обновлёнными seenTime (сервер вернул исходное, но после markAsSeen обновится в БД,
-			// однако нам для отображения можно использовать те же объекты, так как seenTime ещё не обновлён локально.
+			// однако нам для отображения можно использовать те же объекты, так как seenTime ещё не обновлён локально.)
 			// Чтобы не ждать, можно сразу после markAsSeen установить seenTime, но проще довериться следующему poll.
 			// Однако для немедленного отображения прочтения в текущей сессии – обновим локальные копии:
 			for (Message msg : history) {
@@ -491,7 +485,7 @@ public final class Client {
 		close();
 	}
 
-	public static void main(String[] args) {
+	static void main() {
 		Scanner scanner = new Scanner(System.in);
 		while (true) {
 			System.out.print("Enter server host (default 127.0.0.1): ");
