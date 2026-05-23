@@ -4,5 +4,5 @@ import common.dto.User;
 
 import java.io.Serializable;
 
-public record MarkAsSeenRequest(long messageId, User user) implements Serializable {
+public record MarkAsSeenRequest(long messageId) implements Serializable {
 }
