@@ -97,9 +97,9 @@ public final class Client {
 		Object response = cmdIn.readObject();
 		if (response instanceof ErrorMessage(String message)) {
 			System.err.println("Send failed: " + message);
-		} else {
+		} else if(response instanceof SendMessageResponse(Integer mId)){
 			// Добавляем отправленное сообщение в локальную историю
-			Message sentMsg = new Message(0, new MessageContent(content), currentUser, to, LocalDateTime.now(), null);
+			Message sentMsg = new Message(mId, new MessageContent(content), currentUser, to, LocalDateTime.now(), null);
 			currentChatHistory.add(sentMsg);
 			if (inChat && activeChatWith != null && activeChatWith.equals(to)) {
 				redrawChat();
@@ -170,7 +170,7 @@ public final class Client {
 					if (response instanceof GetMessagesResponse(List<Message> messages)) {
 						for (Message msg : messages) {
 							// Если мы в чате с отправителем
-							if (inChat && activeChatWith != null && activeChatWith.equals(msg.from())) {
+							if (messageFromChatter(msg)) {
 								boolean found = false;
 								for (int i = 0; i < currentChatHistory.size(); i++) {
 									if (currentChatHistory.get(i).messageId() == msg.messageId()) {
@@ -229,6 +229,13 @@ public final class Client {
 		pollerThread = new Thread(new Poller());
 		pollerThread.setDaemon(true);
 		pollerThread.start();
+	}
+
+	private boolean messageFromChatter(Message message){
+		if(inChat && activeChatWith != null){
+			return (message.from().equals(currentUser) && message.to().equals(activeChatWith)) || message.from().equals(activeChatWith);
+		}else
+			return false;
 	}
 
 	// ---------- Отображение чата ----------

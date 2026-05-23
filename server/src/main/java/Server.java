@@ -95,8 +95,9 @@ public final class Server {
 								if (to != null && !users.containsKey(to)) {
 									out.writeObject(new ErrorMessage("Recipient not found: " + to.name()));
 								} else {
-									if (sendMessage(content, client, to, LocalDateTime.now()))
-										out.writeObject(new InfoMessage("Message sent"));
+									Integer mId = sendMessage(content, client, to, LocalDateTime.now());
+									if (mId != null)
+										out.writeObject(new SendMessageResponse(mId));
 									else
 										out.writeObject(new ErrorMessage("Message hasn't been sent: internal error"));
 								}
@@ -140,10 +141,8 @@ public final class Server {
 									var client = activeClients.stream().
 											filter(cl -> cl.client != null && cl.client.equals(chatter)).
 											findFirst();
-									System.out.println(chatter + " " + client.isPresent());
 									if(client.isPresent()){
 										client.get().sendMessages(List.of(msg));
-										System.out.println("Msg sent");
 									}
 
 								} else {
@@ -163,7 +162,7 @@ public final class Server {
 						}
 					}
 				} catch (EOFException | SocketException e) {
-					System.out.println("Client disconnected: " + (client != null ? client.name() : "unknown"));
+					System.err.println("Client disconnected: " + (client != null ? client.name() : "unknown"));
 				} catch (IOException | ClassNotFoundException e) {
 					System.err.println("Unexpected error in client handler: " + e.getMessage());
 				}
@@ -200,7 +199,6 @@ public final class Server {
 		public void sendMessages(List<Message> messages) throws IOException {
 			if(out != null && clientSocket.isConnected()){
 				out.writeObject(new GetMessagesResponse(messages));
-				System.out.println("truly marked");
 			}
 		}
 
@@ -485,7 +483,7 @@ public final class Server {
 		return q != null ? q.poll(timeout, unit) : null;
 	}
 
-	private boolean sendMessage(MessageContent content, User from, User to, LocalDateTime dispatchTime) {
+	private Integer sendMessage(MessageContent content, User from, User to, LocalDateTime dispatchTime) {
 		String sql = "INSERT INTO messages (content, fromUser, toUser, dispatchTime) VALUES (?, ?, ?, ?)";
 		try (PreparedStatement stmt = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
 			Integer fromId = users.get(from);
@@ -493,11 +491,11 @@ public final class Server {
 
 			if (toId == null && to != null) {
 				System.err.println("Recipient not found: " + to.name());
-				return false;
+				return null;
 			}
 			if (fromId == null) {
 				System.err.println("Sender not found: " + from.name());
-				return false;
+				return null;
 			}
 
 			stmt.setString(1, content.content());
@@ -512,9 +510,9 @@ public final class Server {
 			if (affected == 1) {
 				ResultSet rs = stmt.getGeneratedKeys();
 				if (rs.next()) {
-					long messageId = rs.getLong(1);
+					int messageId = rs.getInt(1);
 					deliverMessage(new Message(messageId, content, from, to, dispatchTime, null));
-					return true;
+					return messageId;
 				}
 			}
 		} catch (SQLException e) {
@@ -522,7 +520,7 @@ public final class Server {
 					+ " to " + (to == null ? "(broadcast)" : to.name())
 					+ ".\nUnexpected error occurred: " + e.getMessage());
 		}
-		return false;
+		return null;
 	}
 
 	private Message markMessageAsSeen(long messageId){
@@ -537,11 +535,9 @@ public final class Server {
 					User to = usersReverse.get(rs.getInt("toUser"));
 					LocalDateTime dispatchTime = rs.getTimestamp("dispatchTime").toLocalDateTime();
 					LocalDateTime seenTime = rs.getTimestamp("seenTime").toLocalDateTime();
-					var msg = new Message(messageId, new MessageContent(content), from, to, dispatchTime, seenTime);
-					System.out.println("\n" + msg);
-					return msg;
+					return new Message(messageId, new MessageContent(content), from, to, dispatchTime, seenTime);
 				} else {
-					System.out.println("Сообщение с id " + messageId + " не найдено");
+					System.err.println("Сообщение с id " + messageId + " не найдено");
 				}
 			}
 		}catch(SQLException e){
