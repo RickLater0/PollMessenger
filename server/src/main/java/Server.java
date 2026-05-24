@@ -1,3 +1,4 @@
+import common.Logger;
 import common.dto.*;
 import common.messages.*;
 import common.requests.*;
@@ -6,7 +7,6 @@ import common.responses.*;
 import java.net.*;
 import java.io.*;
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.sql.*;
 import java.util.concurrent.*;
@@ -23,27 +23,15 @@ public final class Server {
 	private final Map<Integer, User> userNameMap = new ConcurrentHashMap<>();
 	private final Map<User, BlockingQueue<Message>> messageQueues = new ConcurrentHashMap<>();
 
-	public record LogEntry(LocalDateTime timestamp, LogLevel level, String message, String stackTrace) {
-		LogEntry(LogLevel level, String message, String stackTrace){
-			this(LocalDateTime.now(), level, message, stackTrace);
-		}
+	private final Logger logger = new Logger();
 
-		LogEntry(LogLevel level, String message){
-			this(LocalDateTime.now(), level, message, null);
-		}
-
-		public String format() {
-			String time = timestamp.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"));
-			if (stackTrace != null && !stackTrace.isEmpty()) {
-				return String.format("[%s] %s: %s\n%s", time, level, message, stackTrace);
-			}
-			return String.format("[%s] %s: %s", time, level, message);
-		}
+	public String showLogs(){
+		return logger.showLogs();
 	}
 
-	public enum LogLevel { INFO, ERROR }
-
-	private final List<LogEntry> logs = new CopyOnWriteArrayList<>();
+	public void clearLogs(){
+		logger.showLogs();
+	}
 
 	private Connection connection;
 	private int serverId = -1;
@@ -75,9 +63,9 @@ public final class Server {
 					handle(request);
 				}
 			} catch (EOFException | SocketException e) {
-				logInfo("Client disconnected: " + (client != null ? client.name() : "unknown"));
+				logger.logInfo("Client disconnected: " + (client != null ? client.name() : "unknown"));
 			} catch (IOException | ClassNotFoundException e) {
-				logError("Unexpected error in client handler: ", e.getMessage());
+				logger.logError("Unexpected error in client handler: ", e.getMessage());
 			} finally {
 				logout();
 			}
@@ -95,7 +83,7 @@ public final class Server {
 				case MarkAsSeenRequest(long messageId) -> handleMark(messageId);
 				case PollRequest(User user) -> handlePoll(user);
 				case LogoutRequest() -> logout();
-				default -> logError("Unexpected request type");
+				default -> logger.logError("Unexpected request type");
 			}
 			out.flush();
 		}
@@ -110,7 +98,7 @@ public final class Server {
 			int userId = authoriseUser(name, passwd);
 			out.writeObject(new AuthorisationResponse(userId != -1));
 			if (userId != -1) {
-				logInfo("User authorised: " + name);
+				logger.logInfo("User authorised: " + name);
 				authoriseAsClient(name);
 			}
 		}
@@ -197,7 +185,7 @@ public final class Server {
 				BlockingQueue<Message> senderQueue = messageQueues.get(updated.from());
 				if (senderQueue != null) {
 					if(!senderQueue.offer(updated))
-						logError("SenderQueue error");
+						logger.logError("SenderQueue error");
 				}
 				out.writeObject(new InfoMessage("Message marked as seen"));
 			} else {
@@ -212,7 +200,7 @@ public final class Server {
 			if (client != null) {
 				removeQueueForUser(client);
 				activeClients.remove(this);
-				logInfo("User disconnected: " + client.name());
+				logger.logInfo("User disconnected: " + client.name());
 			}
 		}
 
@@ -260,11 +248,11 @@ public final class Server {
 						ch.start();
 					} catch (SocketException e) {
 						if (running) {
-							logError("Socket closed unexpectedly", e.getMessage());
+							logger.logError("Socket closed unexpectedly", e.getMessage());
 						}
 						break;
 					} catch (IOException e) {
-						logError("Couldn't accept new client.\nUnexpected error occurred", e.getMessage());
+						logger.logError("Couldn't accept new client.\nUnexpected error occurred", e.getMessage());
 					}
 				}
 			});
@@ -272,34 +260,12 @@ public final class Server {
 			return true;
 
 		} catch (IOException | SQLException e){
-			logError("Couldn't start server on port: " + port + ".\nUnexpected error occurred", e.getMessage());
+			logger.logError("Couldn't start server on port: " + port + ".\nUnexpected error occurred", e.getMessage());
 			return false;
 		}
 	}
 
-	private void logInfo(String info){
-		logs.add(new LogEntry(LogLevel.INFO, info));
-	}
 
-	private void logError(String info, String err){
-		logs.add(new LogEntry(LogLevel.ERROR, info, err));
-	}
-
-	private void logError(String info){
-		logs.add(new LogEntry(LogLevel.ERROR, info));
-	}
-
-	public String showLogs(){
-		StringBuilder res = new StringBuilder();
-		for(var entry : logs){
-			res.append(entry.format()).append("\n");
-		}
-		return res.toString();
-	}
-
-	public void clearLogs(){
-		logs.clear();
-	}
 
 	public boolean start(){
 		return start(BASIC_PORT);
@@ -310,7 +276,7 @@ public final class Server {
 		try {
 			connection = DriverManager.getConnection(url, user, password);
 		} catch (SQLException e) {
-			logError("Couldn't connect to DB " + url + ", as user " + user + ".\nUnexpected error occurred", e.getMessage());
+			logger.logError("Couldn't connect to DB " + url + ", as user " + user + ".\nUnexpected error occurred", e.getMessage());
 			corrupted = true;
 		}
 	}
@@ -323,7 +289,7 @@ public final class Server {
 			try {
 				client.sendInfo("Server is closing");
 			} catch (IOException e) {
-				logError("Server closing: Error occurred when sending info message", e.getMessage());
+				logger.logError("Server closing: Error occurred when sending info message", e.getMessage());
 			}
 			client.logout();
 		}
@@ -338,7 +304,7 @@ public final class Server {
 					Thread.currentThread().interrupt();
 				}
 		} catch (IOException e) {
-			logError("Couldn't stop server.\nUnexpected error occurred", e.getMessage());
+			logger.logError("Couldn't stop server.\nUnexpected error occurred", e.getMessage());
 			return false;
 		}
 		activeClients.clear();
@@ -408,7 +374,7 @@ public final class Server {
 			}
 		} catch (SQLException e) {
 			if (e.getSQLState().equals("23505")) return false; // duplicate username
-			logError("Couldn't register user " + name + ".\nUnexpected error occurred", e.getMessage());
+			logger.logError("Couldn't register user " + name + ".\nUnexpected error occurred", e.getMessage());
 		}
 		return false;
 	}
@@ -428,7 +394,7 @@ public final class Server {
 				}
 			}
 		}catch (SQLException e) {
-			logError("Couldn't authorise user " + name + ".\nUnexpected error occurred", e.getMessage());
+			logger.logError("Couldn't authorise user " + name + ".\nUnexpected error occurred", e.getMessage());
 		}
 		return -1;
 	}
@@ -479,7 +445,7 @@ public final class Server {
 			if(toId != null)
 				stmt.setInt(1, toId);
 			else{
-				logError("Couldn't get authorised user " + to.name() + ".");
+				logger.logError("Couldn't get authorised user " + to.name() + ".");
 				return resultList;
 			}
 			if(from != null){
@@ -487,7 +453,7 @@ public final class Server {
 				if(fromId != null)
 					stmt.setInt(2, fromId);
 				else{
-					logError("Couldn't get authorised user " + from.name() + ".");
+					logger.logError("Couldn't get authorised user " + from.name() + ".");
 					return resultList;
 				}
 			}
@@ -497,7 +463,7 @@ public final class Server {
 				}
 			}
 		} catch (SQLException e) {
-			logError("Couldn't get messages sent to user " + to.name() + ".\nUnexpected error occurred", e.getMessage());
+			logger.logError("Couldn't get messages sent to user " + to.name() + ".\nUnexpected error occurred", e.getMessage());
 		}
 		return resultList;
 	}
@@ -519,7 +485,7 @@ public final class Server {
 					BlockingQueue<Message> q = messageQueues.get(u);
 					if (q != null) {
 						if(!q.offer(msg))
-							logError("Couldn't offer a message");
+							logger.logError("Couldn't offer a message");
 					}
 				}
 			}
@@ -527,7 +493,7 @@ public final class Server {
 			BlockingQueue<Message> q = messageQueues.get(recipient);
 			if (q != null)
 				if(!q.offer(msg))
-					logError("Couldn't offer a message");
+					logger.logError("Couldn't offer a message");
 		}
 	}
 
@@ -538,11 +504,11 @@ public final class Server {
 			Integer toId = to == null ? null : userIdMap.get(to);
 
 			if (toId == null && to != null) {
-				logError("Recipient not found: " + to.name());
+				logger.logError("Recipient not found: " + to.name());
 				return null;
 			}
 			if (fromId == null) {
-				logError("Sender not found: " + from.name());
+				logger.logError("Sender not found: " + from.name());
 				return null;
 			}
 
@@ -555,17 +521,22 @@ public final class Server {
 			stmt.setTimestamp(4, Timestamp.valueOf(dispatchTime));
 
 			int affected = stmt.executeUpdate();
+			logger.logInfo("Message from " + from.name() +
+					" to " + (to == null ? "(broadcast)" : to.name()) + " has been sent");
 			if (affected == 1) {
 				try(ResultSet rs = stmt.getGeneratedKeys()){
 					if (rs.next()) {
 						int messageId = rs.getInt(1);
 						deliverMessage(new Message(messageId, content, from, to, dispatchTime, null));
+						logger.logInfo("Message from " + from.name() +
+								" to " + (to == null ? "(broadcast)" : to.name()) +
+								" with " + messageId + " has been delivered");
 						return messageId;
 					}
 				}
 			}
 		} catch (SQLException e) {
-			logError("Couldn't send message from " + from.name()
+			logger.logError("Couldn't send message from " + from.name()
 					+ " to " + (to == null ? "(broadcast)" : to.name())
 					+ ".\nUnexpected error occurred", e.getMessage());
 		}
@@ -586,11 +557,11 @@ public final class Server {
 					LocalDateTime seenTime = rs.getTimestamp("seenTime").toLocalDateTime();
 					return new Message(messageId, new MessageContent(content), from, to, dispatchTime, seenTime);
 				} else {
-					logError("Message with id: " + messageId + " not found");
+					logger.logError("Message with id: " + messageId + " not found");
 				}
 			}
 		}catch(SQLException e){
-			logError("Couldn't mark message " + messageId + " as seen", e.getMessage());
+			logger.logError("Couldn't mark message " + messageId + " as seen", e.getMessage());
 		}
 		return null;
 	}
@@ -616,7 +587,7 @@ public final class Server {
 				}
 			}
 		} catch (SQLException e) {
-			logError("Couldn't get dialog between " + me.name() + " and " + with.name(), e.getMessage());
+			logger.logError("Couldn't get dialog between " + me.name() + " and " + with.name(), e.getMessage());
 		}
 		return result;
 	}
@@ -627,14 +598,14 @@ public final class Server {
 		int choice;
 
 		do {
-			System.out.println("\n-SERVER MENU-");
+			System.out.println("-SERVER MENU-");
 			System.out.println("1. Start");
 			System.out.println("2. Start on port");
 			System.out.println("3. Stop");
 			System.out.println("4. Show logs");
 			System.out.println("5. Clear logs");
 			System.out.println("0. Ext");
-			System.out.print("Choice: ");
+			System.out.print("Act: ");
 
 			while (!scanner.hasNextInt()) {
 				System.out.print("Input must be integer");
@@ -661,6 +632,7 @@ public final class Server {
 						System.out.println("Server stopped successfully");
 					break;
 				case 4:
+					System.out.println("-=LOGS=-");
 					System.out.println(server.showLogs());
 					break;
 				case 5:
@@ -674,6 +646,7 @@ public final class Server {
 					System.out.println("Invalid choice");
 					break;
 			}
+			System.out.print("\n");
 		} while (true);
 	}
 }

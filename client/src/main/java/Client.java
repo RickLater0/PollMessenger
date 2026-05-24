@@ -1,3 +1,4 @@
+import common.Logger;
 import common.dto.*;
 import common.requests.*;
 import common.responses.*;
@@ -16,6 +17,8 @@ public final class Client {
 	private final ObjectInputStream in;
 	private final ObjectOutputStream out;
 
+	private final Logger logger = new Logger();
+	
 	private final Thread listenThread;
 
 	private volatile boolean running = true;
@@ -29,7 +32,7 @@ public final class Client {
 		socket = new Socket(address, port);
 		in = new ObjectInputStream(socket.getInputStream());
 		out = new ObjectOutputStream(socket.getOutputStream());
-		Runtime.getRuntime().addShutdownHook(new Thread(this::logout));
+		Runtime.getRuntime().addShutdownHook(new Thread(this::close));
 		listenThread = new Thread(this::listening);
 		listenThread.setDaemon(true);
 		listenThread.start();
@@ -40,7 +43,7 @@ public final class Client {
 			while (running && !socket.isClosed()) {
 				Object response = in.readObject();
 				if(!incomingResponses.offer(response))
-					System.err.println("Couldn't offer");
+					logger.logError("Couldn't offer");
 			}
 		} catch (EOFException e) {
 			//ignore
@@ -56,7 +59,10 @@ public final class Client {
 		try {
 			if (socket != null && !socket.isClosed()) {
 				sendAsync(new LogoutRequest());
+				in.close();
+				out.close();
 				socket.close();
+				listenThread.interrupt();
 			}
 		} catch (IOException ignored) {}
 	}
@@ -87,9 +93,9 @@ public final class Client {
 	private boolean login(String name, String password) throws IOException, InterruptedException {
 		Object resp = sendAndWait(new AuthorisationRequest(name, password));
 		if (resp instanceof AuthorisationResponse(boolean success) && success) {
-			System.out.println("dsadasd");
 			currentUser = new User(name);
-			System.out.println("Login successful!");
+			System.out.println("Login successful as " + name);
+			System.out.println("Welcome to Messenger Client!");
 			showActiveUsers();
 			return true;
 		}
@@ -112,7 +118,7 @@ public final class Client {
 				}
 			}
 		} else if (resp instanceof ErrorMessage(String message)) {
-			System.err.println(message);
+			logger.logError(message);
 		}
 	}
 
@@ -124,7 +130,7 @@ public final class Client {
 	 */
 	private void openChat(User with) throws IOException, InterruptedException {
 		if (with.equals(currentUser)) {
-			System.out.println("You cannot chat with yourself.");
+			logger.logInfo("You cannot chat with yourself.");
 			return;
 		}
 		// 1. Запрашиваем диалог
@@ -147,7 +153,7 @@ public final class Client {
 			chatPartner = with;
 			System.out.println("You are now in chat with " + with.name() + ". Type your message or /exit to leave chat.");
 		} else if (resp instanceof ErrorMessage(String message)) {
-			System.err.println(message);
+			logger.logError(message);
 		}
 	}
 
@@ -197,11 +203,11 @@ public final class Client {
 						for (Message msg : messages) {
 							// Новое сообщение для пользователя
 							if (msg.to() == null || msg.to().equals(currentUser)) {
-								System.out.println("\n[New message from " + msg.from().name() + "]: " + msg.content().content());
+								logger.logInfo("\n[New message from " + msg.from().name() + "]: " + msg.content().content());
 								// Если мы в чате с этим отправителем, автоматически отмечаем прочитанным
 								if (chatPartner != null && chatPartner.equals(msg.from())) {
 									sendAsync(new MarkAsSeenRequest(msg.messageId()));
-									System.out.println("(auto marked as seen)");
+									logger.logInfo("(auto marked as seen) " + msg.messageId());
 								}
 								// Если не в чате, предложим ответить
 								if (chatPartner == null) {
@@ -212,7 +218,7 @@ public final class Client {
 					}
 				}
 			} catch (InterruptedException | IOException e) {
-				if (running) e.printStackTrace();
+				if (running) logger.logError("Error:", e.getMessage());
 			}
 		});
 		pollThread.setDaemon(true);
@@ -223,7 +229,7 @@ public final class Client {
 		Scanner scanner = new Scanner(System.in);
 		boolean exit = false;
 
-		System.out.println("Welcome to Messenger Client!");
+
 		while (!exit && running) {
 			if (currentUser == null) {
 				// Не авторизованы – показываем меню входа/регистрации
@@ -251,7 +257,7 @@ public final class Client {
 						String pass = scanner.nextLine().trim();
 						try {
 							if (register(name, pass)) {
-								System.out.println("Registration successful! Please login.");
+								System.out.println("Registration successful");
 							} else {
 								System.out.println("Registration failed (username may exist).");
 							}
@@ -275,18 +281,18 @@ public final class Client {
 					System.out.print("> ");
 					String input = scanner.nextLine().trim();
 					if (input.startsWith("/users")) {
-						try { showActiveUsers(); } catch (Exception e) { e.printStackTrace(); }
+						try { showActiveUsers(); } catch (Exception e) { logger.logError("Error:", e.getMessage()); }
 					} else if (input.startsWith("/chat ")) {
 						String target = input.substring(6).trim();
 						if (!target.isEmpty()) {
-							try { openChat(new User(target)); } catch (Exception e) { e.printStackTrace(); }
+							try { openChat(new User(target)); } catch (Exception e) { logger.logError("Error:", e.getMessage()); }
 						} else {
 							System.out.println("Usage: /chat username");
 						}
 					} else if (input.startsWith("/broadcast ")) {
 						String msg = input.substring(11).trim();
 						if (!msg.isEmpty()) {
-							try { broadcast(msg); } catch (IOException e) { e.printStackTrace(); }
+							try { broadcast(msg); } catch (IOException e) { logger.logError("Error:", e.getMessage()); }
 						}
 					} else if (input.equals("/logout")) {
 						try {
@@ -294,7 +300,7 @@ public final class Client {
 							currentUser = null;
 							chatPartner = null;
 							System.out.println("Logged out.");
-						} catch (IOException e) { e.printStackTrace(); }
+						} catch (IOException e) { logger.logError("Error:", e.getMessage()); }
 					} else if (input.equals("/exit")) {
 						exit = true;
 					} else {
@@ -320,31 +326,63 @@ public final class Client {
 		scanner.close();
 	}
 
-	private void logout(){
-
-	}
-
 	static void main(String[] args) {
-		Scanner scanner = new Scanner(System.in);
-		System.out.print("Server address (ip:port) [127.0.0.1:43500]: ");
-		String input = scanner.nextLine().trim();
+		// Параметры по умолчанию
 		String host = "127.0.0.1";
 		int port = 43500;
-		if(args.length == 2){
-			host = args[0];
-			try { port = Integer.parseInt(args[1]); } catch (NumberFormatException ignored) {}
-		}else if (!input.isEmpty()) {
-			String[] parts = input.split(":");
-			host = parts[0];
-			if (parts.length > 1) {
-				try { port = Integer.parseInt(parts[1]); } catch (NumberFormatException ignored) {}
+		String loginName = null;
+		String loginPassword = null;
+
+		// Разбор аргументов вида -s host:port -c user -p pass
+		for (int i = 0; i < args.length; i++) {
+			switch (args[i]) {
+				case "-s":
+					if (i + 1 < args.length) {
+						String serverArg = args[++i];
+						String[] parts = serverArg.split(":");
+						host = parts[0];
+						if (parts.length > 1) {
+							try { port = Integer.parseInt(parts[1]); } catch (NumberFormatException ignored) {}
+						}
+					}
+					break;
+				case "-c":
+					if (i + 1 < args.length) loginName = args[++i];
+					break;
+				case "-p":
+					if (i + 1 < args.length) loginPassword = args[++i];
+					break;
+			}
+		}
+
+		// Запрос адреса сервера, если не задан через -s
+		if (host.equals("127.0.0.1") && port == 43500 && args.length == 0) {
+			Scanner scanner = new Scanner(System.in);
+			System.out.print("Server address (ip:port) [127.0.0.1:43500]: ");
+			String input = scanner.nextLine().trim();
+			if (!input.isEmpty()) {
+				String[] parts = input.split(":");
+				host = parts[0];
+				if (parts.length > 1) {
+					try { port = Integer.parseInt(parts[1]); } catch (NumberFormatException ignored) {}
+				}
 			}
 		}
 
 		try {
 			Client client = new Client(host, port);
-			client.console();
-		} catch (IOException e) {
+			// Если указаны и логин, и пароль — выполняем автоматический вход
+			if (loginName != null && loginPassword != null) {
+				if (client.login(loginName, loginPassword)) {
+					client.console();
+				} else {
+					client.logger.logError("Auto-login failed. Starting manual mode.");
+					client.console();
+				}
+			} else {
+				client.console();
+			}
+		} catch (IOException | InterruptedException e) {
 			System.err.println("Cannot connect to server: " + e.getMessage());
 		}
 	}
