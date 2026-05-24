@@ -30,7 +30,7 @@ public final class Server {
 	}
 
 	public void clearLogs(){
-		logger.showLogs();
+		logger.clearLogs();
 	}
 
 	private Connection connection;
@@ -637,6 +637,12 @@ public final class Server {
 					break;
 				case 5:
 					server.clearLogs();
+					break;
+				case 6:
+					server.logger.clearInfo();
+					break;
+				case 7:
+					server.logger.clearErrors();
 					break;
 				case 0:
 					server.stop();
