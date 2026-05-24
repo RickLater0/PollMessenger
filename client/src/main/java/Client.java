@@ -13,12 +13,15 @@ import java.util.Scanner;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
 
 public final class Client {
 	private final Socket socket;
 	private final ObjectInputStream in;
 	private final ObjectOutputStream out;
+
+	private final Socket pollSocket;
+	private final ObjectInputStream pollIn;
+	private final ObjectOutputStream pollOut;
 
 	private final Logger logger = new Logger();
 	
@@ -27,21 +30,29 @@ public final class Client {
 	private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm:ss");
 
 	private volatile boolean running = true;
-	private User currentUser = null;
-	private User chatPartner = null;
+	private volatile User currentUser = null;
+	private volatile User chatPartner = null;
 
 	private final BlockingQueue<Object> incomingResponses = new LinkedBlockingQueue<>();
 
 	List<Message> currentDialogue = new CopyOnWriteArrayList<>();
 
 	public Client(String address, int port) throws IOException {
-		socket = new Socket(address, port);
-		in = new ObjectInputStream(socket.getInputStream());
-		out = new ObjectOutputStream(socket.getOutputStream());
-		Runtime.getRuntime().addShutdownHook(new Thread(this::close));
-		listenThread = new Thread(this::listening);
-		listenThread.setDaemon(true);
-		listenThread.start();
+
+			socket = new Socket(address, port);
+			pollSocket = new Socket(address, port);
+			in = new ObjectInputStream(socket.getInputStream());
+			out = new ObjectOutputStream(socket.getOutputStream());
+
+			pollIn = new ObjectInputStream(pollSocket.getInputStream());
+			pollOut = new ObjectOutputStream(pollSocket.getOutputStream());
+
+			Runtime.getRuntime().addShutdownHook(new Thread(this::close));
+			listenThread = new Thread(this::listening);
+			listenThread.setDaemon(true);
+			listenThread.start();
+
+
 	}
 
 	void listening(){
@@ -60,6 +71,16 @@ public final class Client {
 		}
 	}
 
+	void logout(){
+		try {
+			sendAsync(new LogoutRequest());
+			poller.logout();
+			currentUser = null;
+			chatPartner = null;
+			System.out.println("Logged out.");
+		} catch (IOException e) { logger.logError("Error:", e.getMessage()); }
+	}
+
 	public void close() {
 		running = false;
 		try {
@@ -68,7 +89,13 @@ public final class Client {
 				in.close();
 				out.close();
 				socket.close();
+				if(pollSocket != null && !pollSocket.isClosed()) {
+					pollOut.close();
+					pollIn.close();
+					pollSocket.close();
+				}
 				listenThread.interrupt();
+				System.out.println(logger.showLogs());
 			}
 		} catch (IOException ignored) {}
 	}
@@ -93,17 +120,116 @@ public final class Client {
 	}
 
 	/**
+	 * Запустить отдельный поток для long polling.
+	 * Этот поток будет постоянно отправлять PollRequest и получать новые сообщения.
+	 * Новые сообщения обрабатываются здесь же и, если они от текущего chatPartner,
+	 * автоматически отмечаются как прочитанные и выводятся.
+	 */
+	private class Poller extends Thread {
+		private boolean authPoll(String name, String password) throws IOException {
+			pollOut.writeObject(new AuthPollRequest(name, password));
+			pollOut.flush();
+			Object resp = null;
+			try {
+				resp = pollIn.readObject();
+			} catch (ClassNotFoundException e) {
+				logger.logError("Couldn't read response from server: " + e.getMessage());
+			}
+			if (resp instanceof AuthPollResponse(boolean success) && success) {
+				return true;
+			}
+			System.err.println("Poll auth failed");
+			return false;
+		}
+
+		@Override
+		public void run() {
+			try {
+				while (running && !pollSocket.isClosed()) {
+					if(currentUser == null)
+						break;
+					pollOut.writeObject(new PollRequest());
+					pollOut.flush();
+					Object response = pollIn.readObject();  // блокируется, но на отдельном сокете
+					handlePollResponse(response);
+				}
+			} catch (IOException | ClassNotFoundException e) {
+				if (running) logger.logError("Poll error: " + e.getMessage());
+			}
+		}
+
+		private void handlePollResponse(Object response) {
+			switch (response) {
+				case GetMessagesResponse(List<Message> messages) -> {
+					for (Message msg : messages) {
+						if (chatPartner != null && chatPartner.equals(msg.from())) {
+							currentDialogue.add(msg);
+							try { sendAsync(new MarkAsSeenRequest(msg.messageId())); } catch (IOException ignored) {}
+							msg.setSeenTime(LocalDateTime.now());
+							redrawChatScreen();
+						} else if (chatPartner == null && (msg.to() == null || msg.to().equals(currentUser))) {
+							System.out.print("\n[New from " + msg.from().name() + "]: " + msg.content().content());
+							System.out.print("\n> ");
+						}
+					}
+				}
+				case SendMessageResponse(int realId) -> {
+					if (chatPartner != null) {
+						Message toRemove = null;
+						for (Message msg : currentDialogue) {
+							if (msg.messageId() < 0 && msg.from().equals(currentUser) && msg.to().equals(chatPartner)) {
+								toRemove = msg;
+								break;
+							}
+						}
+						if (toRemove != null) {
+							currentDialogue.remove(toRemove);
+							currentDialogue.add(new Message(realId, toRemove.content(), toRemove.from(), toRemove.to(),
+									toRemove.dispatchTime(), toRemove.seenTime()));
+							redrawChatScreen();
+						}
+					}
+				}
+				case MarkAsSeenResponse(long msgId, LocalDateTime seenTime) -> {
+					for (Message msg : currentDialogue) {
+						if (msg.messageId() == msgId && msg.from().equals(currentUser)) {
+							msg.setSeenTime(seenTime);
+							redrawChatScreen();
+							break;
+						}
+					}
+				}
+				default -> logger.logError("Unexpected poll response: " + response);
+			}
+		}
+
+		public void logout(){
+			try {
+				pollOut.writeObject(new LogoutRequest());
+				pollOut.flush();
+			} catch (IOException e) { logger.logError("Poller Error:", e.getMessage()); }
+		}
+	}
+
+	Poller poller = new Poller();
+
+	/**
 	 * Авторизация существующего пользователя.
 	 * При успехе сохраняет currentUser и запрашивает список активных пользователей.
 	 */
 	private boolean login(String name, String password) throws IOException, InterruptedException {
 		Object resp = sendAndWait(new AuthorisationRequest(name, password));
 		if (resp instanceof AuthorisationResponse(boolean success) && success) {
-			currentUser = new User(name);
-			System.out.println("Login successful as " + name);
-			System.out.println("Welcome to Messenger Client!");
-			showActiveUsers();
-			return true;
+			if(poller.authPoll(name, password)){
+				currentUser = new User(name);
+				System.out.println("Login successful as " + name);
+				System.out.println("Welcome to Messenger Client!");
+				System.out.println("Print /help to see commands");
+				showActiveUsers();
+				poller.setDaemon(true);
+				poller.start();
+				return true;
+			}
 		}
 		System.err.println("Login failed");
 		return false;
@@ -215,63 +341,7 @@ public final class Client {
 		}
 	}
 
-	/**
-	 * Запустить отдельный поток для long polling.
-	 * Этот поток будет постоянно отправлять PollRequest и получать новые сообщения.
-	 * Новые сообщения обрабатываются здесь же и, если они от текущего chatPartner,
-	 * автоматически отмечаются как прочитанные и выводятся.
-	 */
-	private void startPolling() {
-		Thread pollThread = new Thread(() -> {
-			try {
-				while (running && currentUser != null && !socket.isClosed()) {
-					// Отправляем запрос на получение сообщений (тайм-аут 30 сек)
-					sendAsync(new PollRequest(currentUser));
-					// Ждём ответа (он придёт в responseReader, но мы его перехватим через очередь)
-					Object response = incomingResponses.poll(35, TimeUnit.SECONDS);
-					if (response instanceof GetMessagesResponse(List<Message> messages)) {
-						for (Message msg : messages) {
-							// Если мы в чате с отправителем и сообщение адресовано нам (или broadcast)
-							if (chatPartner != null && chatPartner.equals(msg.from())) {
-								currentDialogue.add(msg);
-								sendAsync(new MarkAsSeenRequest(msg.messageId()));
-								msg.setSeenTime(LocalDateTime.now()); // локально помечаем прочитанным
-								redrawChatScreen();
-							} else if (chatPartner == null && (msg.to() == null || msg.to().equals(currentUser))) {
-								System.out.print("\n[New" + msg.from().name() + "]");
-								System.out.print("\n> ");
-							}
-						}
-					}else if (response instanceof SendMessageResponse(int realId)) {
-						// Ищем временное сообщение от текущего пользователя с отрицательным ID
-						for (Message msg : currentDialogue) {
-							if (msg.messageId() < 0 && msg.from().equals(currentUser) && msg.to().equals(chatPartner)) {
-								currentDialogue.remove(msg);
-								Message updated = new Message(realId, msg.content(), msg.from(), msg.to(),
-										msg.dispatchTime(), msg.seenTime());
-								currentDialogue.add(updated);
-								redrawChatScreen();
-								break;
-							}
-						}
-					}else if (response instanceof MarkAsSeenResponse(long msgId, LocalDateTime seenTime)) {
-						// Отправитель получает уведомление, что его сообщение прочитано
-						for (Message msg : currentDialogue) {
-							if (msg.messageId() == msgId && msg.from().equals(currentUser)) {
-								msg.setSeenTime(seenTime);
-								redrawChatScreen();
-								break;
-							}
-						}
-					}
-				}
-			} catch (InterruptedException | IOException e) {
-				if (running) logger.logError("Error:", e.getMessage());
-			}
-		});
-		pollThread.setDaemon(true);
-		pollThread.start();
-	}
+
 
 	private void console() {
 		Scanner scanner = new Scanner(System.in);
@@ -280,7 +350,6 @@ public final class Client {
 
 		while (!exit && running) {
 			if (currentUser == null) {
-				// Не авторизованы – показываем меню входа/регистрации
 				System.out.println("\n1. Login\n2. Register\n0. Exit");
 				System.out.print("Choice: ");
 				String line = scanner.nextLine().trim();
@@ -291,11 +360,10 @@ public final class Client {
 						System.out.print("Password: ");
 						String pass = scanner.nextLine().trim();
 						try {
-							if (login(name, pass)) {
-								startPolling();
-							}
-						} catch (Exception e) {
-							System.err.println("Login error: " + e.getMessage());
+							if(!login(name, pass))
+								System.err.println("Invalid username or password");
+						} catch (IOException | InterruptedException e) {
+							logger.logError("Error:", e.getMessage());
 						}
 					}
 					case "2" -> {
@@ -317,19 +385,13 @@ public final class Client {
 					default -> System.out.println("Invalid choice");
 				}
 			} else {
-				// Авторизованы – режим выбора действия
+
+				String input;
 				if (chatPartner == null) {
-					// Не в чате
-					System.out.println("\nCommands:");
-					System.out.println("  /users          - show active users");
-					System.out.println("  /chat <name>    - open chat with user");
-					System.out.println("  /broadcast <msg> - send message to everyone");
-					System.out.println("  /logout         - logout");
-					System.out.println("  /exit           - quit client");
 					System.out.print("> ");
-					String input = scanner.nextLine().trim();
+					input = scanner.nextLine().trim();
 					if (input.startsWith("/users")) {
-						try { showActiveUsers(); } catch (Exception e) { logger.logError("Error:", e.getMessage()); }
+						try {showActiveUsers(); } catch (Exception e) { logger.logError("Error:", e.getMessage()); }
 					} else if (input.startsWith("/chat ")) {
 						String target = input.substring(6).trim();
 						if (!target.isEmpty()) {
@@ -343,26 +405,36 @@ public final class Client {
 							try { broadcast(msg); } catch (IOException e) { logger.logError("Error:", e.getMessage()); }
 						}
 					} else if (input.equals("/logs show")) {
+						System.out.println("-=LOGS=-");
 						System.out.println(logger.showLogs());
 					} else if (input.equals("/logs clear")) {
 						System.out.println("Cleared");
 						logger.clearLogs();
+					} else if (input.equals("/clear")) {
+						clearConsole();
+					}else if (input.equals("/help")) {
+						System.out.println("\nCommands:");
+						System.out.println("  /users          - show active users");
+						System.out.println("  /chat <name>    - open chat with user");
+						System.out.println("  /broadcast <msg> - send message to everyone");
+						System.out.println("  /logout         - logout");
+						System.out.println("  /exit           - quit client");
+						System.out.println("  /logs show      - show logs");
+						System.out.println("  /logs clear     - purge logs list");
+						System.out.println("  /clear          - clear console window");
+						System.out.println("  /help           - see this list");
+
 					}else if (input.equals("/logout")) {
-						try {
-							sendAsync(new LogoutRequest());
-							currentUser = null;
-							chatPartner = null;
-							System.out.println("Logged out.");
-						} catch (IOException e) { logger.logError("Error:", e.getMessage()); }
+						logout();
 					} else if (input.equals("/exit")) {
 						exit = true;
 					} else {
 						System.out.println("Unknown command. Type /users, /chat, /broadcast, /logout, /exit");
 					}
 				} else {
-					// В режиме чата
+
 					System.out.print("[c:" + chatPartner.name() + "] > ");
-					String input = scanner.nextLine().trim();
+					input = scanner.nextLine().trim();
 					if (input.equals("/exit")) {
 						exitChat();
 					} else if (!input.isEmpty()) {

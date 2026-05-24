@@ -6,7 +6,7 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 public class Logger {
-	public record LogEntry(LocalDateTime timestamp, LogLevel level, String message, String stackTrace) {
+	protected record LogEntry(LocalDateTime timestamp, LogLevel level, String message, String stackTrace) {
 		LogEntry(LogLevel level, String message, String stackTrace){
 			this(LocalDateTime.now(), level, message, stackTrace);
 		}
@@ -45,7 +45,7 @@ public class Logger {
 		for(var entry : logs){
 			res.append(entry.format()).append("\n");
 		}
-		return res.toString();
+		return res.toString().isBlank() ? "NO LOGS" : res.toString();
 	}
 
 	public void clearLogs(){
