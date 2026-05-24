@@ -188,6 +188,9 @@ public final class Server {
 						logger.logError("SenderQueue error");
 				}
 				out.writeObject(new InfoMessage("Message marked as seen"));
+				var chatter = activeClients.stream().filter(cl -> cl.client == updated.from()).findAny();
+				chatter.ifPresent(clientHandler ->
+						clientHandler.sendMarkResponse(new MarkAsSeenResponse(updated.messageId(), updated.seenTime())));
 			} else {
 				out.writeObject(new GetMessagesResponse(List.of()));
 			}
@@ -221,6 +224,18 @@ public final class Server {
 				client = new User(name);
 				authorised = true;
 				addQueueForUser(client);
+			}
+		}
+
+		public void sendMarkResponse(MarkAsSeenResponse markAsSeenResponse){
+			if(!clientSocket.isClosed() && out != null){
+
+				try {
+					out.writeObject(markAsSeenResponse);
+					out.flush();
+				} catch (IOException e) {
+					logger.logError("Couldn't send mark response to " + client, e.getMessage());
+				}
 			}
 		}
 	}
@@ -637,6 +652,7 @@ public final class Server {
 					break;
 				case 5:
 					server.clearLogs();
+					System.out.println("Cleared");
 					break;
 				case 6:
 					server.logger.clearInfo();

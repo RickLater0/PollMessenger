@@ -1,7 +1,8 @@
 package common.responses;
 
-import common.dto.User;
+import java.io.Serializable;
+import java.time.LocalDateTime;
 
-public record MarkAsSeenResponse(User from, User whoSeen, long messageId) {
+public record MarkAsSeenResponse(long messageId, LocalDateTime seenTime) implements Serializable {
 
 }

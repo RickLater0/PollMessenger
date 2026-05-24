@@ -6,9 +6,12 @@ import common.messages.*;
 
 import java.net.*;
 import java.io.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Scanner;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
@@ -21,12 +24,15 @@ public final class Client {
 	
 	private final Thread listenThread;
 
+	private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm:ss");
+
 	private volatile boolean running = true;
 	private User currentUser = null;
 	private User chatPartner = null;
 
 	private final BlockingQueue<Object> incomingResponses = new LinkedBlockingQueue<>();
 
+	List<Message> currentDialogue = new CopyOnWriteArrayList<>();
 
 	public Client(String address, int port) throws IOException {
 		socket = new Socket(address, port);
@@ -133,25 +139,19 @@ public final class Client {
 			logger.logInfo("You cannot chat with yourself.");
 			return;
 		}
-		// 1. Запрашиваем диалог
 		Object resp = sendAndWait(new GetDialogRequest(with));
 		if (resp instanceof GetMessagesResponse(List<Message> dialog)) {
-			// Выводим диалог в хронологическом порядке
-			System.out.println("\n=== Chat with " + with.name() + " ===");
-			for (Message msg : dialog) {
-				String prefix = msg.from().equals(currentUser) ? "You" : msg.from().name();
-				System.out.printf("[%s] %s: %s%n",
-						msg.dispatchTime().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss")),
-						prefix, msg.content().content());
-			}
-			// 2. Отмечаем как прочитанные все непрочитанные сообщения от with
-			for (Message msg : dialog) {
+			currentDialogue.clear();
+			currentDialogue.addAll(dialog);
+			chatPartner = with;
+
+			for (Message msg : currentDialogue) {
 				if (msg.to() != null && msg.to().equals(currentUser) && msg.from().equals(with) && msg.seenTime() == null) {
 					sendAsync(new MarkAsSeenRequest(msg.messageId()));
+					msg.setSeenTime(LocalDateTime.now());
 				}
 			}
-			chatPartner = with;
-			System.out.println("You are now in chat with " + with.name() + ". Type your message or /exit to leave chat.");
+			redrawChatScreen();
 		} else if (resp instanceof ErrorMessage(String message)) {
 			logger.logError(message);
 		}
@@ -161,12 +161,16 @@ public final class Client {
 	 * Отправить сообщение текущему собеседнику в чате.
 	 */
 	private void sendMessageToChat(String text) throws IOException {
-		if (chatPartner == null) {
-			System.out.println("No active chat. Use 'chat <username>' first.");
-			return;
-		}
+		if (chatPartner == null) return;
+
+		// Временное сообщение (отрицательный ID, чтобы не путать с реальными)
+		long tempId = -System.currentTimeMillis();
+		Message tempMsg = new Message(tempId, new MessageContent(text), currentUser, chatPartner, LocalDateTime.now(), null);
+		currentDialogue.add(tempMsg);
+		redrawChatScreen();
+
+		// Реальная отправка (асинхронно, не ждём ответа для плавности)
 		sendAsync(new SendMessageRequest(new MessageContent(text), chatPartner));
-		System.out.println("[You] " + text);
 	}
 
 	/**
@@ -182,7 +186,33 @@ public final class Client {
 	 */
 	private void exitChat() {
 		chatPartner = null;
+		currentDialogue.clear();
+		clearConsole();
 		System.out.println("You left the chat.");
+	}
+
+	private void redrawChatScreen() {
+		if (chatPartner == null) return;
+		// Очистка экрана (ANSI escape codes — работает в большинстве терминалов)
+		clearConsole();
+		System.out.println("=== Chat with " + chatPartner.name() + " ===");
+		if (currentDialogue.isEmpty()) {
+			System.out.println("No messages yet.");
+		} else {
+			for (Message msg : currentDialogue) {
+				String sender = msg.from().equals(currentUser) ? "You" : msg.from().name();
+				String time = msg.dispatchTime().format(TIME_FORMATTER);
+
+				if (msg.seenTime() != null) {
+					System.out.printf("[%s>%s] %s: %s%n", time, msg.seenTime().format(TIME_FORMATTER), sender, msg.content().content());
+				}else {
+					if(msg.messageId() < 0)
+						System.out.printf("[%s>... ] %s: %s%n", time, sender, msg.content().content());
+					else
+						System.out.printf("[%s>sent] %s: %s%n", time, sender, msg.content().content());
+				}
+			}
+		}
 	}
 
 	/**
@@ -201,18 +231,36 @@ public final class Client {
 					Object response = incomingResponses.poll(35, TimeUnit.SECONDS);
 					if (response instanceof GetMessagesResponse(List<Message> messages)) {
 						for (Message msg : messages) {
-							// Новое сообщение для пользователя
-							if (msg.to() == null || msg.to().equals(currentUser)) {
-								logger.logInfo("\n[New message from " + msg.from().name() + "]: " + msg.content().content());
-								// Если мы в чате с этим отправителем, автоматически отмечаем прочитанным
-								if (chatPartner != null && chatPartner.equals(msg.from())) {
-									sendAsync(new MarkAsSeenRequest(msg.messageId()));
-									logger.logInfo("(auto marked as seen) " + msg.messageId());
-								}
-								// Если не в чате, предложим ответить
-								if (chatPartner == null) {
-									System.out.println("Type 'chat " + msg.from().name() + "' to reply.");
-								}
+							// Если мы в чате с отправителем и сообщение адресовано нам (или broadcast)
+							if (chatPartner != null && chatPartner.equals(msg.from())) {
+								currentDialogue.add(msg);
+								sendAsync(new MarkAsSeenRequest(msg.messageId()));
+								msg.setSeenTime(LocalDateTime.now()); // локально помечаем прочитанным
+								redrawChatScreen();
+							} else if (chatPartner == null && (msg.to() == null || msg.to().equals(currentUser))) {
+								System.out.print("\n[New" + msg.from().name() + "]");
+								System.out.print("\n> ");
+							}
+						}
+					}else if (response instanceof SendMessageResponse(int realId)) {
+						// Ищем временное сообщение от текущего пользователя с отрицательным ID
+						for (Message msg : currentDialogue) {
+							if (msg.messageId() < 0 && msg.from().equals(currentUser) && msg.to().equals(chatPartner)) {
+								currentDialogue.remove(msg);
+								Message updated = new Message(realId, msg.content(), msg.from(), msg.to(),
+										msg.dispatchTime(), msg.seenTime());
+								currentDialogue.add(updated);
+								redrawChatScreen();
+								break;
+							}
+						}
+					}else if (response instanceof MarkAsSeenResponse(long msgId, LocalDateTime seenTime)) {
+						// Отправитель получает уведомление, что его сообщение прочитано
+						for (Message msg : currentDialogue) {
+							if (msg.messageId() == msgId && msg.from().equals(currentUser)) {
+								msg.setSeenTime(seenTime);
+								redrawChatScreen();
+								break;
 							}
 						}
 					}
@@ -294,7 +342,12 @@ public final class Client {
 						if (!msg.isEmpty()) {
 							try { broadcast(msg); } catch (IOException e) { logger.logError("Error:", e.getMessage()); }
 						}
-					} else if (input.equals("/logout")) {
+					} else if (input.equals("/logs show")) {
+						System.out.println(logger.showLogs());
+					} else if (input.equals("/logs clear")) {
+						System.out.println("Cleared");
+						logger.clearLogs();
+					}else if (input.equals("/logout")) {
 						try {
 							sendAsync(new LogoutRequest());
 							currentUser = null;
@@ -308,7 +361,7 @@ public final class Client {
 					}
 				} else {
 					// В режиме чата
-					System.out.print("[Chat with " + chatPartner.name() + "] > ");
+					System.out.print("[c:" + chatPartner.name() + "] > ");
 					String input = scanner.nextLine().trim();
 					if (input.equals("/exit")) {
 						exitChat();
@@ -325,6 +378,21 @@ public final class Client {
 		close();
 		scanner.close();
 	}
+
+	private void clearConsole() {
+		try {
+			String os = System.getProperty("os.name").toLowerCase();
+			if (os.contains("win")) {
+				new ProcessBuilder("cmd", "/c", "cls").inheritIO().start().waitFor();
+			} else {
+				System.out.print("\033[H\033[2J");
+				System.out.flush();
+			}
+		} catch (Exception e) {
+			// ignore
+		}
+	}
+
 
 	static void main(String[] args) {
 		// Параметры по умолчанию
