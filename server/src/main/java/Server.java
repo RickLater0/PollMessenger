@@ -653,10 +653,24 @@ public final class Server {
 		return result;
 	}
 
-	static void main(){
+	static void main(String[] args){
 		Server server = new Server();
 		Scanner scanner = new Scanner(System.in);
 		int choice;
+
+		int port = 43500;
+
+
+		for(int i = 0; i < args.length; i++){
+			switch (args[i]) {
+				case "-p":
+					if (i + 1 < args.length) try { port = Integer.parseInt(args[++i]); } catch (NumberFormatException ignored) {}
+					break;
+				case "-s":
+					server.start(port);
+					break;
+			}
+		}
 
 		do {
 
@@ -685,7 +699,7 @@ public final class Server {
 						System.out.print("Input must be integer");
 						scanner.next();
 					}
-					int port = scanner.nextInt();
+					port = scanner.nextInt();
 					if(server.start(port))
 						System.out.println("Server stared successfully");
 					break;
