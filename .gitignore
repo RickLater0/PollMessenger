@@ -163,3 +163,4 @@ buildNumber.properties
 
 .bat
 .txt
+/.idea/queries/Query.sql

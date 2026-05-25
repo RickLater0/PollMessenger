@@ -58,7 +58,7 @@ public final class Server {
 
 	/**
 	 * Внутренний класс обработчика клиента.
-	 * Три состояния: не авторизован, авторизован, авторизован как поллер
+	 * Три состояния: не авторизован, авторизован, авторизован как poller
 	 * (состояние зависит от authorised и в какой коллекции лежит сей продукт)
 	 * */
 	private class ClientHandler extends Thread {
@@ -299,7 +299,6 @@ public final class Server {
 
 	public Server(){
 		running = false;
-		dbConnect("jdbc:postgresql://localhost:5432/proglab4", "postgres", "password");
 		Runtime.getRuntime().addShutdownHook(new Thread(() -> {
 			if (running) stop();
 		}));
@@ -312,10 +311,13 @@ public final class Server {
 		if(running || corrupted)
 			return false;
 		try{
-			serverSocket = new ServerSocket(port);
+			dbConnect("jdbc:postgresql://localhost:5432/proglab4", "postgres", "password");
 			registerServer(port);
+			serverSocket = new ServerSocket(port);
+
+
 			running = true;
-			logger.logInfo("Server started");
+			logger.logInfo("Server started on port" + port);
 			main = new Thread(() -> {
 				while (running && !serverSocket.isClosed()) {
 					try {
