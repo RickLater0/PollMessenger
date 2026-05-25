@@ -150,7 +150,7 @@ public final class Client {
 						break;
 					pollOut.writeObject(new PollRequest());
 					pollOut.flush();
-					Object response = pollIn.readObject();  // блокируется, но на отдельном сокете
+					Object response = pollIn.readObject();
 					handlePollResponse(response);
 				}
 			} catch (IOException | ClassNotFoundException e) {
@@ -217,6 +217,7 @@ public final class Client {
 	 * Авторизация существующего пользователя.
 	 * При успехе сохраняет currentUser и запрашивает список активных пользователей.
 	 */
+	@SuppressWarnings(value = "BooleanMethodIsAlwaysInverted")
 	private boolean login(String name, String password) throws IOException, InterruptedException {
 		Object resp = sendAndWait(new AuthorisationRequest(name, password));
 		if (resp instanceof AuthorisationResponse(boolean success) && success) {
@@ -288,14 +289,10 @@ public final class Client {
 	 */
 	private void sendMessageToChat(String text) throws IOException {
 		if (chatPartner == null) return;
-
-		// Временное сообщение (отрицательный ID, чтобы не путать с реальными)
 		long tempId = -System.currentTimeMillis();
 		Message tempMsg = new Message(tempId, new MessageContent(text), currentUser, chatPartner, LocalDateTime.now(), null);
 		currentDialogue.add(tempMsg);
 		redrawChatScreen();
-
-		// Реальная отправка (асинхронно, не ждём ответа для плавности)
 		sendAsync(new SendMessageRequest(new MessageContent(text), chatPartner));
 	}
 
@@ -319,7 +316,6 @@ public final class Client {
 
 	private void redrawChatScreen() {
 		if (chatPartner == null) return;
-		// Очистка экрана (ANSI escape codes — работает в большинстве терминалов)
 		clearConsole();
 		System.out.println("=== Chat with " + chatPartner.name() + " ===");
 		if (currentDialogue.isEmpty()) {
@@ -342,7 +338,7 @@ public final class Client {
 	}
 
 
-
+	///консоль. спагетти
 	private void console() {
 		Scanner scanner = new Scanner(System.in);
 		boolean exit = false;
@@ -465,18 +461,28 @@ public final class Client {
 		}
 	}
 
-
+	/**Точка входа
+	 * поддерживаются команды для консольного вызова
+	 * java -jar client.jar [ФЛАГ]
+	 * Флаги:
+	 * -i {ip:port} адрес сервера
+	 * -r логин для РЕГИСТРАЦИИ
+	 * -l логин для АВТОРИЗАЦИИ (-r и -l не быть существовать вместе)
+	 * -p пароль для входа
+	 * Далее - терминал управления клиентом
+	 * /help для помощи*/
 	static void main(String[] args) {
 		// Параметры по умолчанию
 		String host = "127.0.0.1";
 		int port = 43500;
+		boolean isIpSet = false;
 		String loginName = null;
+		String registerName = null;
 		String loginPassword = null;
 
-		// Разбор аргументов вида -s host:port -c user -p pass
 		for (int i = 0; i < args.length; i++) {
 			switch (args[i]) {
-				case "-s":
+				case "-i":
 					if (i + 1 < args.length) {
 						String serverArg = args[++i];
 						String[] parts = serverArg.split(":");
@@ -484,9 +490,13 @@ public final class Client {
 						if (parts.length > 1) {
 							try { port = Integer.parseInt(parts[1]); } catch (NumberFormatException ignored) {}
 						}
+						isIpSet = true;
 					}
 					break;
-				case "-c":
+				case "-r":
+					if (i + 1 < args.length) registerName = args[++i];
+					break;
+				case "-l":
 					if (i + 1 < args.length) loginName = args[++i];
 					break;
 				case "-p":
@@ -495,8 +505,8 @@ public final class Client {
 			}
 		}
 
-		// Запрос адреса сервера, если не задан через -s
-		if (host.equals("127.0.0.1") && port == 43500 && args.length == 0) {
+		// Запрос адреса сервера, если не задан через флаги
+		if (!isIpSet) {
 			Scanner scanner = new Scanner(System.in);
 			System.out.print("Server address (ip:port) [127.0.0.1:43500]: ");
 			String input = scanner.nextLine().trim();
@@ -511,17 +521,23 @@ public final class Client {
 
 		try {
 			Client client = new Client(host, port);
-			// Если указаны и логин, и пароль — выполняем автоматический вход
-			if (loginName != null && loginPassword != null) {
-				if (client.login(loginName, loginPassword)) {
-					client.console();
-				} else {
-					client.logger.logError("Auto-login failed. Starting manual mode.");
-					client.console();
+			// Каша из логики флагов и выводов ошибок подключения
+			if (loginName != null && registerName == null && loginPassword != null) {
+				if (!client.login(loginName, loginPassword)) {
+					System.err.println("Auto-login failed. Starting manual mode.");
 				}
-			} else {
-				client.console();
+			} else if (loginName == null && registerName != null && loginPassword != null) {
+				if (!client.register(registerName, loginPassword)) {
+					System.err.println("Auto-register failed. Starting manual mode.");
+				}
+			}else if(loginName == null && registerName == null && loginPassword != null){
+				System.err.println("Can't register only with password.");
+			}else if(loginName != null && registerName != null){
+				System.err.println("-l and -r can't use both.");
+			}else if(loginName != null || registerName != null){
+				System.err.println("Can't login without password");
 			}
+			client.console();
 		} catch (IOException | InterruptedException e) {
 			System.err.println("Cannot connect to server: " + e.getMessage());
 		}

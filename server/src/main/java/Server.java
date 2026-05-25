@@ -18,12 +18,18 @@ public final class Server {
 	public static final int BASIC_PORT = 43500;
 
 	private ServerSocket serverSocket;
+	/**Активные клиенты*/
 	private final List<ClientHandler> activeClients = new CopyOnWriteArrayList<>();
+	/**Действующие poller-сокеты*/
 	private final List<ClientHandler> activePollers = new CopyOnWriteArrayList<>();
+	/**Имя-идентификатор в базе для пользователей*/
 	private final Map<User, Integer> userIdMap = new ConcurrentHashMap<>();
+	/**Идентификатор-имя в базе для пользователей*/
 	private final Map<Integer, User> userNameMap = new ConcurrentHashMap<>();
+	/**Очереди сообщений для пользователей*/
 	private final Map<User, BlockingQueue<Message>> messageQueues = new ConcurrentHashMap<>();
 
+	/**Основной инструмент, записывающий логи*/
 	private final Logger logger = new Logger();
 
 	public String showLogs(){
@@ -34,12 +40,27 @@ public final class Server {
 		logger.clearLogs();
 	}
 
+	/**Подключение к БД*/
 	private Connection connection;
+	/**
+	 * Идентификатор сервера в БД, нужен для регистрации пользователя
+	 * (подключение к конкретному серверу)*/
 	private int serverId = -1;
 
+	/**
+	 * Отображает статус сервера - запущен или нет*/
 	private boolean running;
+
+	/**
+	 * Ошибка соединения с БД - сервер ломается*/
+
 	private boolean corrupted;
 
+	/**
+	 * Внутренний класс обработчика клиента.
+	 * Три состояния: не авторизован, авторизован, авторизован как поллер
+	 * (состояние зависит от authorised и в какой коллекции лежит сей продукт)
+	 * */
 	private class ClientHandler extends Thread {
 		private final Socket clientSocket;
 		private User client = null;
@@ -53,6 +74,8 @@ public final class Server {
 			setDaemon(true);
 		}
 
+		/**Получение объектов общения от клиента
+		 * отправка их в дальнейшую обработку*/
 		@Override
 		public void run() {
 			try {
@@ -72,6 +95,7 @@ public final class Server {
 			}
 		}
 
+		/**Обработка объектов общения-ДТОшек*/
 		private void handle(Object request) throws IOException {
 			switch (request) {
 				case RegistrationRequest(String name, String passwd) -> register(name, passwd);
@@ -89,6 +113,8 @@ public final class Server {
 			}
 			out.flush();
 		}
+
+		/*Далее названия функций говорят сами за себя*/
 
 		private void register(String name, String passwd) throws IOException {
 			boolean isOk = registerUser(name, passwd);
@@ -278,7 +304,10 @@ public final class Server {
 			if (running) stop();
 		}));
 	}
+	/**Поток - acceptor: принимает пользователей*/
 	private Thread main;
+
+	/**Запуск сервера на порту port*/
 	public boolean start(int port){
 		if(running || corrupted)
 			return false;
@@ -313,10 +342,14 @@ public final class Server {
 
 
 
+	/**Запуск на порту 43500*/
 	public boolean start(){
 		return start(BASIC_PORT);
 	}
 
+	/**Подключение к БД
+	 * По сути динамические - можно задавать параметры
+	 * По факту в конструкторе применяется только localhost:5432*/
 	public void dbConnect(String url, String user, String password){
 		corrupted = false;
 		try {
@@ -328,6 +361,8 @@ public final class Server {
 		}
 	}
 
+	/**Остановка сервера
+	 * Автоматическое отключение всех пользователей*/
 	public boolean stop(){
 		if(!running || corrupted)
 			return false;
@@ -368,6 +403,8 @@ public final class Server {
 		return true;
 	}
 
+	/**Регистрация/авторизация сервера
+	 * Автоматическая подгрузка пользователей с this.serverId = user.serverId*/
 	private void registerServer(int port) throws SQLException {
 		String localIp = getLocalIpAddress();
 		String sql = "INSERT INTO servers (serverIp, port) VALUES (?::inet, ?) " +
@@ -400,6 +437,7 @@ public final class Server {
 		}
 	}
 
+	////Получение локального IP
 	private String getLocalIpAddress() {
 		try {
 			return InetAddress.getLocalHost().getHostAddress();
@@ -407,6 +445,8 @@ public final class Server {
 			return "127.0.0.1";
 		}
 	}
+
+	//Далее названия методов говорят сами за себя
 
 	private boolean registerUser(String name, String passwd){
 		String sql = "insert into users (serverId, username, passwd) values (?, ?, crypt(?, gen_salt('bf')))";
@@ -653,6 +693,13 @@ public final class Server {
 		return result;
 	}
 
+	/**Точка входа
+	 * поддерживаются команды для консольного вызова
+	 * java -jar server.jar [ФЛАГ]
+	 * Флаги:
+	 * -p {число} порт, на котором запустится сервер (-s не обязателен)
+	 * -s флаг для запуска сервера
+	 * Вызов меню управления сервером*/
 	static void main(String[] args){
 		Server server = new Server();
 		Scanner scanner = new Scanner(System.in);
@@ -661,15 +708,22 @@ public final class Server {
 		int port = 43500;
 
 
+		boolean autoStart = false;
+
 		for(int i = 0; i < args.length; i++){
 			switch (args[i]) {
 				case "-p":
-					if (i + 1 < args.length) try { port = Integer.parseInt(args[++i]); } catch (NumberFormatException ignored) {}
+					if (i + 1 < args.length) try { port = Integer.parseInt(args[++i]); autoStart = true;} catch (NumberFormatException ignored) {}
 					break;
 				case "-s":
-					server.start(port);
+					autoStart = true;
+
 					break;
 			}
+		}
+
+		if(autoStart){
+			server.start(port);
 		}
 
 		do {
