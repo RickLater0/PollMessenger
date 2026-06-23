@@ -1,3 +1,5 @@
+import DAO.DAO_Conf;
+import DAO.UserDAO;
 import common.Logger;
 import common.dto.*;
 import common.messages.*;
@@ -10,7 +12,6 @@ import java.time.LocalDateTime;
 import java.util.*;
 import java.sql.*;
 import java.util.concurrent.*;
-import java.util.stream.Collectors;
 
 
 public final class Server {
@@ -23,11 +24,13 @@ public final class Server {
 	/**Действующие poller-сокеты*/
 	private final List<ClientHandler> activePollers = new CopyOnWriteArrayList<>();
 	/**Имя-идентификатор в базе для пользователей*/
-	private final Map<User, Integer> userIdMap = new ConcurrentHashMap<>();
+	private final Map<String, User> usersByName = new ConcurrentHashMap<>();
 	/**Идентификатор-имя в базе для пользователей*/
-	private final Map<Integer, User> userNameMap = new ConcurrentHashMap<>();
+	private final Map<Integer, User> usersById = new ConcurrentHashMap<>();
 	/**Очереди сообщений для пользователей*/
-	private final Map<User, BlockingQueue<Message>> messageQueues = new ConcurrentHashMap<>();
+	private final Map<String, BlockingQueue<Message>> messageQueues = new ConcurrentHashMap<>();
+	//TODO реализовать виртуальные потоки
+	private final ExecutorService virtualThreadExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
 	/**Основной инструмент, записывающий логи*/
 	private final Logger logger = new Logger();
@@ -66,11 +69,14 @@ public final class Server {
 		private User client = null;
 		private boolean authorised = false;
 
-		ObjectOutputStream out;
-		ObjectInputStream in;
+		private final ObjectOutputStream out;
+		private final ObjectInputStream in;
 
-		public ClientHandler(Socket socket) {
+		public ClientHandler(Socket socket) throws IOException {
 			this.clientSocket = socket;
+			out = new ObjectOutputStream(clientSocket.getOutputStream());
+			in = new ObjectInputStream(clientSocket.getInputStream());
+
 			setDaemon(true);
 		}
 
@@ -79,15 +85,12 @@ public final class Server {
 		@Override
 		public void run() {
 			try {
-				out = new ObjectOutputStream(clientSocket.getOutputStream());
-				in = new ObjectInputStream(clientSocket.getInputStream());
-
 				while (!clientSocket.isClosed() && !Thread.currentThread().isInterrupted()) {
 					Object request = in.readObject();
 					handle(request);
 				}
 			} catch (EOFException | SocketException e) {
-				logger.logInfo("Client disconnected: " + (client != null ? client.name() : "unknown"));
+				logger.logInfo("Client disconnected: " + (client != null ? client : "unknown"));
 			} catch (IOException | ClassNotFoundException e) {
 				logger.logError("Unexpected error in client handler: ", e.getMessage());
 			} finally {
@@ -101,33 +104,50 @@ public final class Server {
 				case RegistrationRequest(String name, String passwd) -> register(name, passwd);
 				case AuthorisationRequest(String name, String passwd) -> authorise(name, passwd);
 				case GetNamesRequest() -> getNames();
-				case GetDialogRequest(User with) -> handleDialog(with);
+				case GetDialogRequest(String with) -> handleDialog(with);
 				case GetMessagesRequest(User from, MessageSeenState state) -> handleGetMessages(from, state);
 				case GetAllMessagesRequest(MessageSeenState state) -> handleGetAllMessages(state);
-				case SendMessageRequest(MessageContent content, User to) -> handleSend(content, to);
+				case SendMessageRequest(MessageContent content, String to) -> handleSend(content, to);
 				case MarkAsSeenRequest(long messageId) -> handleMark(messageId);
 				case AuthPollRequest(String name, String passwd) -> handlePollInit(name, passwd);
 				case PollRequest() -> handlePoll();
 				case LogoutRequest() -> logout();
 				default -> logger.logError("Unexpected request type");
 			}
-			out.flush();
 		}
 
 		/*Далее названия функций говорят сами за себя*/
 
+		void atomicSend(Object response) throws IOException {
+			if (!clientSocket.isClosed() && out != null) {
+				synchronized (out){
+					out.writeObject(response);
+					out.flush();
+				}
+			}
+		}
+
+		void atomicSendToPoller(Object response) throws IOException {
+			var pollerOpt = activePollers.stream().filter(
+					cl -> cl.client.equals(client)
+				).findFirst();
+			if(pollerOpt.isPresent()) {
+				pollerOpt.get().atomicSend(response);
+			}
+		}
+
 		private void register(String name, String passwd) throws IOException {
-			boolean isOk = registerUser(name, passwd);
-			out.writeObject(new AuthorisationResponse(isOk));
-			if (isOk) authoriseAsClient(name);
+			var user = registerUser(name, passwd);
+			atomicSend(new AuthorisationResponse(user != null ? user.id() : -1));
+			if (user != null) authoriseAsClient(user);
 		}
 
 		private void authorise(String name, String passwd) throws IOException {
 			int userId = authoriseUser(name, passwd);
-			out.writeObject(new AuthorisationResponse(userId != -1));
+			atomicSend(new AuthorisationResponse(userId));
 			if (userId != -1) {
 				logger.logInfo("User authorised: " + name);
-				authoriseAsClient(name);
+				authoriseAsClient(new User(userId, name));
 			}
 		}
 
@@ -136,25 +156,25 @@ public final class Server {
 				sendError("Error: User not authorised");
 				return;
 			}
-			out.writeObject(
+			atomicSend(
 					new GetNamesResponse(
-							activeClients.stream()
-									.map(ClientHandler::getClient)
-									.filter(Objects::nonNull)
-									.filter(u -> u != this.client)
-									.collect(Collectors.toList())
+							usersById.values().stream().filter(
+									user ->
+											user != null && !user.equals(client)
+									)
+									.toList()
 					)
 			);
-			logger.logInfo("User " + client.name() + " got active names");
+			logger.logInfo("User " + client + " got active names");
 		}
 
-		private void handleDialog(User with) throws IOException {
+		private void handleDialog(String with) throws IOException {
 			if (!authorised) {
 				sendError("Error: User not authorised");
 				return;
 			}
 			List<Message> dialog = getDialog(client, with);
-			out.writeObject(new GetMessagesResponse(dialog));
+			atomicSend(new GetMessagesResponse(dialog));
 		}
 
 		private void handleGetMessages(User from, MessageSeenState state) throws IOException {
@@ -162,7 +182,7 @@ public final class Server {
 				sendError("Error: User not authorised");
 				return;
 			}
-			out.writeObject(new GetMessagesResponse(getMessages(from, client, state)));
+			atomicSend(new GetMessagesResponse(getMessages(from, client, state)));
 		}
 
 		private void handleGetAllMessages(MessageSeenState state) throws IOException {
@@ -170,28 +190,28 @@ public final class Server {
 				sendError("Error: User not authorised");
 				return;
 			}
-			out.writeObject(new GetMessagesResponse(getMessages(client, state)));
+			atomicSend(new GetMessagesResponse(getMessages(client, state)));
 		}
 
-		private void handleSend(MessageContent content, User to) throws IOException {
+		private void handleSend(MessageContent content, String to) throws IOException {
 			if (!authorised) {
 				sendError("Error: User not authorised");
 				return;
 			}
-			if (to != null && !userIdMap.containsKey(to)) {
-				sendError("Recipient not found: " + to.name());
+			if (to != null && !usersByName.containsKey(to)) {
+				sendError("Recipient not found: " + to);
 				return;
 			}
 
-			Integer mId = sendMessage(content, client, to, LocalDateTime.now());
+			Integer mId = sendMessage(content, client.name(), to, LocalDateTime.now());
 			if (mId != null)
-				out.writeObject(new SendMessageResponse(mId));
+				atomicSendToPoller(new SendMessageResponse(mId));
 			else
 				sendError("Message hasn't been sent: internal error");
 		}
 
 		private void handlePoll() throws IOException {
-			if (client == null || !messageQueues.containsKey(client)) {
+			if (client == null || !messageQueues.containsKey(client.name())) {
 				sendError("Invalid poll request for user: " + client);
 				return;
 			}
@@ -200,8 +220,8 @@ public final class Server {
 				return;
 			}
 			try {
-				Message msg = messageQueues.get(client).poll(30, TimeUnit.SECONDS);
-				out.writeObject(new GetMessagesResponse(msg != null ? List.of(msg) : List.of()));
+				Message msg = messageQueues.get(client.name()).poll(30, TimeUnit.SECONDS);
+				atomicSend(new GetMessagesResponse(msg != null ? List.of(msg) : List.of()));
 			} catch (InterruptedException e) {
 				Thread.currentThread().interrupt();
 				sendError("Poll interrupted");
@@ -210,10 +230,10 @@ public final class Server {
 
 		private void handlePollInit(String name, String passwd) throws IOException {
 			int userId = authoriseUser(name, passwd);
-			out.writeObject(new AuthPollResponse(userId != -1));
+			atomicSend(new AuthPollResponse(userId != -1));
 			if (userId != -1) {
 				logger.logInfo("Poller authorised: " + name);
-				authoriseAsPoller(name);
+				authoriseAsPoller(new User(userId, name));
 			}
 		}
 
@@ -228,13 +248,13 @@ public final class Server {
 				if (senderQueue != null) {
 					if(!senderQueue.offer(updated))
 						logger.logError("SenderQueue error");
+					atomicSend(new InfoMessage("Message marked as seen"));
+					var chatter = activePollers.stream().filter(cl -> cl.client.name().equals(updated.from())).findAny();
+					chatter.ifPresent(clientHandler ->
+							clientHandler.sendMarkResponse(new MarkAsSeenResponse(updated.messageId(), updated.seenTime())));
 				}
-				out.writeObject(new InfoMessage("Message marked as seen"));
-				var chatter = activeClients.stream().filter(cl -> cl.client == updated.from()).findAny();
-				chatter.ifPresent(clientHandler ->
-						clientHandler.sendMarkResponse(new MarkAsSeenResponse(updated.messageId(), updated.seenTime())));
 			} else {
-				out.writeObject(new GetMessagesResponse(List.of()));
+				atomicSend(new GetMessagesResponse(List.of()));
 			}
 		}
 
@@ -252,31 +272,31 @@ public final class Server {
 		}
 
 		public void sendError(String err) throws IOException {
-			logger.logError("Err message to " + client + err);
-			out.writeObject(new ErrorMessage(err));
+			logger.logError("Err message sent to " + client + " " + err);
+			atomicSend(new ErrorMessage(err));
 		}
 
 		public void sendInfo(String info) throws IOException {
-			logger.logInfo("Err message to " + client + info);
-			out.writeObject(new InfoMessage(info));
+			logger.logInfo("Info message sent to " + client + " " + info);
+			atomicSend(new InfoMessage(info));
 		}
 
 		public User getClient() {
 			return this.client;
 		}
 
-		private void authoriseAsClient(String name) {
-			if (name != null && !name.isEmpty()) {
-				client = new User(name);
+		private void authoriseAsClient(User user) {
+			if (user != null) {
+				client = user;
 				authorised = true;
 
 				activeClients.add(this);
 			}
 		}
 
-		private void authoriseAsPoller(String name) {
-			if (name != null && !name.isEmpty()) {
-				client = new User(name);
+		private void authoriseAsPoller(User user) {
+			if (user != null) {
+				client = user;
 				authorised = true;
 
 				addQueueForUser(client);
@@ -288,9 +308,8 @@ public final class Server {
 			if(!clientSocket.isClosed() && out != null){
 				try {
 					logger.logInfo("Mark as seen response send: " + markAsSeenResponse);
-					out.writeObject(markAsSeenResponse);
-					out.flush();
-				} catch (IOException e) {
+					atomicSendToPoller(markAsSeenResponse);
+				} catch (Exception e) {
 					logger.logError("Couldn't send mark response to " + client, e.getMessage());
 				}
 			}
@@ -317,7 +336,7 @@ public final class Server {
 
 
 			running = true;
-			logger.logInfo("Server started on port" + port);
+			logger.logInfo("Server started on port: " + port);
 			main = new Thread(() -> {
 				while (running && !serverSocket.isClosed()) {
 					try {
@@ -355,7 +374,7 @@ public final class Server {
 	public void dbConnect(String url, String user, String password){
 		corrupted = false;
 		try {
-			connection = DriverManager.getConnection(url, user, password);
+			connection = DAO_Conf.getConnection();
 			logger.logInfo("DB connected");
 		} catch (SQLException e) {
 			logger.logError("Couldn't connect to DB " + url + ", as user " + user + ".\nUnexpected error occurred", e.getMessage());
@@ -418,16 +437,20 @@ public final class Server {
 			try(ResultSet rs = stmt.executeQuery()){
 				if (rs.next()) {
 					this.serverId = rs.getInt("serverId");
+					DAO_Conf.serverId = serverId;
 					try(PreparedStatement stmt1 = connection.prepareStatement(
 							"select username, userId from users where serverId = ?")
 					){
 						stmt1.setInt(1, serverId);
 						try(ResultSet rs1 = stmt1.executeQuery()){
 							while(rs1.next()){
-								var user = new User(rs1.getString("username"));
+								var name = rs1.getString("username");
 								int userId = rs1.getInt("userId");
-								userIdMap.put(user, userId);
-								userNameMap.put(userId, user);
+
+								var user = new User(userId, name);
+
+								usersByName.put(name, user);
+								usersById.put(userId, user);
 								logger.logInfo("User fetched " + user.name());
 							}
 						}
@@ -450,29 +473,21 @@ public final class Server {
 
 	//Далее названия методов говорят сами за себя
 
-	private boolean registerUser(String name, String passwd){
-		String sql = "insert into users (serverId, username, passwd) values (?, ?, crypt(?, gen_salt('bf')))";
-		try(PreparedStatement stmt = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)){
-			stmt.setInt(1, serverId);
-			stmt.setString(2, name);
-			stmt.setString(3, passwd);
-			int affected = stmt.executeUpdate();
-			if(affected > 0){
-				try(ResultSet rs = stmt.getGeneratedKeys()){
-					if(rs.next()){
-						var user = new User(name);
-						userIdMap.put(user, rs.getInt(1));
-						userNameMap.put(rs.getInt(1), user);
-						logger.logInfo("New user registered " + user.name());
-					}
-					return true;
-				}
+	private User registerUser(String name, String passwd){
+		try{
+			var user = UserDAO.insert(name, passwd);
+			if(user != null){
+				usersByName.put(user.name(), user);
+				usersById.put(user.id(), user);
+				logger.logInfo("New user registered " + user.name());
 			}
-		} catch (SQLException e) {
-			if (e.getSQLState().equals("23505")) return false; // duplicate username
+			return user;
+		}catch (SQLException e) {
 			logger.logError("Couldn't register user " + name + ".\nUnexpected error occurred", e.getMessage());
 		}
-		return false;
+		return null;
+
+
 	}
 
 	private int authoriseUser(String name, String passwd){
@@ -484,8 +499,9 @@ public final class Server {
 			try(ResultSet rs = stmt.executeQuery()) {
 				if (rs.next()) {
 					int userId = rs.getInt("userId");
-					userIdMap.put(new User(name), userId);
-					userNameMap.put(userId, new User(name));
+					var usr = new User(userId, name);
+					usersByName.put(name, usr);
+					usersById.put(userId, usr);
 					return userId;
 				}
 			}
@@ -524,9 +540,8 @@ public final class Server {
 		Timestamp seenTs = rs.getTimestamp("seenTime");
 		LocalDateTime seen = seenTs != null ? seenTs.toLocalDateTime() : null;
 		MessageContent content = new MessageContent(contentStr);
-		User from = new User(fromName);
-		User to = toName != null ? new User(toName) : null;
-		return new Message(id, content, from, to, dispatch, seen);
+
+		return new Message(id, content, fromName, toName, dispatch, seen);
 	}
 
 	private List<Message> getMessages(User to, MessageSeenState state){
@@ -537,7 +552,7 @@ public final class Server {
 		List<Message> resultList = new ArrayList<>();
 		String sql = getSqlMessages(state, from);
 		try (PreparedStatement stmt = connection.prepareStatement(sql)){
-			Integer toId = userIdMap.get(to);
+			Integer toId = usersByName.get(to.name()).id();
 			if(toId != null)
 				stmt.setInt(1, toId);
 			else{
@@ -545,7 +560,7 @@ public final class Server {
 				return resultList;
 			}
 			if(from != null){
-				Integer fromId = userIdMap.get(from);
+				Integer fromId = usersByName.get(from.name()).id();
 				if(fromId != null)
 					stmt.setInt(2, fromId);
 				else{
@@ -566,27 +581,27 @@ public final class Server {
 	}
 
 	public void addQueueForUser(User user) {
-		messageQueues.putIfAbsent(user, new LinkedBlockingQueue<>());
+		messageQueues.putIfAbsent(user.name(), new LinkedBlockingQueue<>());
 	}
 
 	public void removeQueueForUser(User user) {
-		messageQueues.remove(user);
+		messageQueues.remove(user.name());
 	}
 
 	public void deliverMessage(Message msg) {
-		User recipient = msg.to();
+		var recipient = msg.to();
 		if (recipient == null) {
 			for (ClientHandler ch : activeClients) {
 				User u = ch.getClient();
-				if (u != null && !u.equals(msg.from())) {
-					BlockingQueue<Message> q = messageQueues.get(u);
+				if (u != null && !u.name().equals(msg.from())) {
+					BlockingQueue<Message> q = messageQueues.get(u.name());
 					if (q != null) {
 						if(!q.offer(msg))
 							logger.logError("Couldn't offer a message");
 						else
 							logger.logInfo("Messages get with id " + msg.messageId() +
-									"from" + (msg.from() == null ? "(all) " : msg.from().name()) +
-									" to " + (msg.to().name() == null ? "(all) " : msg.from().name()));
+									"from" + (msg.from() == null ? "(all) " : msg.from()) +
+									" to " + (msg.to() == null ? "(all) " : msg.from()));
 					}
 				}
 			}
@@ -598,18 +613,18 @@ public final class Server {
 		}
 	}
 
-	private Integer sendMessage(MessageContent content, User from, User to, LocalDateTime dispatchTime) {
+	private Integer sendMessage(MessageContent content, String from, String to, LocalDateTime dispatchTime) {
 		String sql = "INSERT INTO messages (content, fromUser, toUser, dispatchTime) VALUES (?, ?, ?, ?)";
 		try (PreparedStatement stmt = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-			Integer fromId = userIdMap.get(from);
-			Integer toId = to == null ? null : userIdMap.get(to);
+			Integer fromId = usersByName.get(from).id();
+			Integer toId = (to == null) ? null : usersByName.get(to).id();
 
 			if (toId == null && to != null) {
-				logger.logError("Recipient not found: " + to.name());
+				logger.logError("Recipient not found: " + to);
 				return null;
 			}
 			if (fromId == null) {
-				logger.logError("Sender not found: " + from.name());
+				logger.logError("Sender not found: " + from);
 				return null;
 			}
 
@@ -622,23 +637,23 @@ public final class Server {
 			stmt.setTimestamp(4, Timestamp.valueOf(dispatchTime));
 
 			int affected = stmt.executeUpdate();
-			logger.logInfo("Message from " + from.name() +
-					" to " + (to == null ? "(broadcast)" : to.name()) + " has been sent");
+			logger.logInfo("Message from " + from +
+					" to " + (to == null ? "(broadcast)" : to) + " has been sent");
 			if (affected == 1) {
 				try(ResultSet rs = stmt.getGeneratedKeys()){
 					if (rs.next()) {
 						int messageId = rs.getInt(1);
-						deliverMessage(new Message(messageId, content, from, to, dispatchTime, null));
-						logger.logInfo("Message from " + from.name() +
-								" to " + (to == null ? "(broadcast)" : to.name()) +
+						deliverMessage(new Message(messageId, content, from, to, dispatchTime));
+						logger.logInfo("Message from " + from +
+								" to " + (to == null ? "(broadcast)" : to) +
 								" with " + messageId + " has been delivered");
 						return messageId;
 					}
 				}
 			}
 		} catch (SQLException e) {
-			logger.logError("Couldn't send message from " + from.name()
-					+ " to " + (to == null ? "(broadcast)" : to.name())
+			logger.logError("Couldn't send message from " + from
+					+ " to " + (to == null ? "(broadcast)" : to)
 					+ ".\nUnexpected error occurred", e.getMessage());
 		}
 		return null;
@@ -652,12 +667,12 @@ public final class Server {
 			try (ResultSet rs = stmt.executeQuery()) {
 				if (rs.next()) {
 					String content = rs.getString("content");
-					User from = userNameMap.get(rs.getInt("fromUser"));
-					User to = userNameMap.get(rs.getInt("toUser"));
+					User from = usersById.get(rs.getInt("fromUser"));
+					User to = usersById.get(rs.getInt("toUser"));
 					LocalDateTime dispatchTime = rs.getTimestamp("dispatchTime").toLocalDateTime();
 					LocalDateTime seenTime = rs.getTimestamp("seenTime").toLocalDateTime();
 					logger.logInfo("Message marked with id " + messageId);
-					return new Message(messageId, new MessageContent(content), from, to, dispatchTime, seenTime);
+					return new Message(messageId, new MessageContent(content), from.name(), to.name(), dispatchTime, seenTime);
 				} else {
 					logger.logError("Message with id: " + messageId + " not found");
 				}
@@ -668,29 +683,32 @@ public final class Server {
 		return null;
 	}
 
-	private List<Message> getDialog(User me, User with) {
+	private List<Message> getDialog(User me, String with) {
 		List<Message> result = new ArrayList<>();
 		String sql = "SELECT m.messageId, m.content, fromU.username AS fromName, toU.username AS toName, " +
 				"m.dispatchTime, m.seenTime " +
 				"FROM messages m " +
-				"LEFT JOIN users fromU ON m.fromUser = fromU.userId " +
+				"INNER JOIN users fromU ON m.fromUser = fromU.userId " +
 				"LEFT JOIN users toU ON m.toUser = toU.userId " +
-				"WHERE (fromU.username = ? AND (toU.username = ? OR m.toUser is null)) " +
-				"   OR (fromU.username = ? AND (toU.username = ? OR m.toUser is null)) " +
+				"WHERE fromU.serverId = ? and toU.serverId = ? and " +
+				"((fromU.username = ? AND (toU.username = ? OR m.toUser is null)) " +
+				"   OR (fromU.username = ? AND (toU.username = ? OR m.toUser is null))) " +
 				"ORDER BY m.dispatchTime";
 		try (PreparedStatement stmt = connection.prepareStatement(sql)) {
-			stmt.setString(1, me.name());
-			stmt.setString(2, with.name());
-			stmt.setString(3, with.name());
-			stmt.setString(4, me.name());
+			stmt.setInt(1, DAO_Conf.serverId);
+			stmt.setInt(2, DAO_Conf.serverId);
+			stmt.setString(3, me.name());
+			stmt.setString(4, with);
+			stmt.setString(5, with);
+			stmt.setString(6, me.name());
 			try(ResultSet rs = stmt.executeQuery()){
 				while (rs.next()) {
 					result.add(resultSetToMessage(rs));
 				}
 			}
-			logger.logInfo("Get dialog between " + me.name() + " and " + with.name());
+			logger.logInfo("Get dialog between " + me.name() + " and " + with);
 		} catch (SQLException e) {
-			logger.logError("Couldn't get dialog between " + me.name() + " and " + with.name(), e.getMessage());
+			logger.logError("Couldn't get dialog between " + me.name() + " and " + with, e.getMessage());
 		}
 		return result;
 	}

@@ -5,5 +5,5 @@ import common.dto.User;
 
 import java.io.Serializable;
 
-public record SendMessageRequest(MessageContent content, User to) implements Serializable {
+public record SendMessageRequest(MessageContent content, String to) implements Serializable {
 }

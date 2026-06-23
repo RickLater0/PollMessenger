@@ -1,6 +1,6 @@
 package common.responses;
 
 import java.io.Serializable;
-
-public record AuthorisationResponse(boolean success) implements Serializable {
+//id == -1 значит авторизация не прошла
+public record AuthorisationResponse(Integer id) implements Serializable {
 }

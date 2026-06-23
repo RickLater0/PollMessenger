@@ -24,14 +24,17 @@ public final class Client {
 	private final ObjectOutputStream pollOut;
 
 	private final Logger logger = new Logger();
-	
+
 	private final Thread listenThread;
+
+	//TODO создать коллекцию для хранения кешированных пользователей. Использовать её при открытии чата и других взаимодействиях
+	// с другими пользователями
 
 	private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm:ss");
 
-	private volatile boolean running = true;
+	private volatile boolean running  = true;
 	private volatile User currentUser = null;
-	private volatile User chatPartner = null;
+	private volatile String chatPartner = null;
 
 	private final BlockingQueue<Object> incomingResponses = new LinkedBlockingQueue<>();
 
@@ -39,28 +42,32 @@ public final class Client {
 
 	public Client(String address, int port) throws IOException {
 
-			socket = new Socket(address, port);
-			pollSocket = new Socket(address, port);
-			in = new ObjectInputStream(socket.getInputStream());
-			out = new ObjectOutputStream(socket.getOutputStream());
+		socket = new Socket(address, port);
+		pollSocket = new Socket(address, port);
+		in = new ObjectInputStream(socket.getInputStream());
+		out = new ObjectOutputStream(socket.getOutputStream());
 
-			pollIn = new ObjectInputStream(pollSocket.getInputStream());
-			pollOut = new ObjectOutputStream(pollSocket.getOutputStream());
+		pollIn = new ObjectInputStream(pollSocket.getInputStream());
+		pollOut = new ObjectOutputStream(pollSocket.getOutputStream());
 
-			Runtime.getRuntime().addShutdownHook(new Thread(this::close));
-			listenThread = new Thread(this::listening);
-			listenThread.setDaemon(true);
-			listenThread.start();
-
-
+		Runtime.getRuntime().addShutdownHook(new Thread(this::close));
+		listenThread = new Thread(this::listening);
+		listenThread.setDaemon(true);
+		listenThread.start();
 	}
 
-	void listening(){
+	void listening() {
 		try {
 			while (running && !socket.isClosed()) {
 				Object response = in.readObject();
-				if(!incomingResponses.offer(response))
-					logger.logError("Couldn't offer");
+				if(response instanceof InfoMessage(String msg))
+					logger.logInfo("Server - " + msg);
+				else if(response instanceof ErrorMessage(String msg))
+					logger.logInfo("Server ERROR - " + msg);
+				else {
+					if (!incomingResponses.offer(response))
+						logger.logError("Couldn't offer");
+				}
 			}
 		} catch (EOFException e) {
 			//ignore
@@ -71,14 +78,16 @@ public final class Client {
 		}
 	}
 
-	void logout(){
+	void logout() {
 		try {
 			sendAsync(new LogoutRequest());
 			poller.logout();
 			currentUser = null;
 			chatPartner = null;
 			System.out.println("Logged out.");
-		} catch (IOException e) { logger.logError("Error:", e.getMessage()); }
+		} catch (IOException e) {
+			logger.logError("Error:", e.getMessage());
+		}
 	}
 
 	public void close() {
@@ -89,7 +98,7 @@ public final class Client {
 				in.close();
 				out.close();
 				socket.close();
-				if(pollSocket != null && !pollSocket.isClosed()) {
+				if (pollSocket != null && !pollSocket.isClosed()) {
 					pollOut.close();
 					pollIn.close();
 					pollSocket.close();
@@ -97,13 +106,16 @@ public final class Client {
 				listenThread.interrupt();
 				System.out.println(logger.showLogs());
 			}
-		} catch (IOException ignored) {}
+		} catch (IOException ignored) {
+		}
 	}
 
 	private Object sendAndWait(Object request) throws IOException, InterruptedException {
 		out.writeObject(request);
 		out.flush();
-		return incomingResponses.take();
+		var resp = incomingResponses.take();
+		logger.logInfo("Sync response - " + resp.getClass().getSimpleName());
+		return resp;
 	}
 
 	private void sendAsync(Object request) throws IOException {
@@ -113,8 +125,8 @@ public final class Client {
 
 	private boolean register(String name, String password) throws IOException, InterruptedException {
 		Object resp = sendAndWait(new RegistrationRequest(name, password));
-		if (resp instanceof AuthorisationResponse(boolean success)) {
-			return success;
+		if (resp instanceof AuthorisationResponse(Integer userId)) {
+			return userId != -1;
 		}
 		return false;
 	}
@@ -146,14 +158,14 @@ public final class Client {
 		public void run() {
 			try {
 				while (running && !pollSocket.isClosed()) {
-					if(currentUser == null)
+					if (currentUser == null)
 						break;
 					pollOut.writeObject(new PollRequest());
 					pollOut.flush();
 					Object response = pollIn.readObject();
 					handlePollResponse(response);
 				}
-			} catch (IOException | ClassNotFoundException e) {
+			} catch (Exception e) {
 				if (running) logger.logError("Poll error: " + e.getMessage());
 			}
 		}
@@ -162,13 +174,20 @@ public final class Client {
 			switch (response) {
 				case GetMessagesResponse(List<Message> messages) -> {
 					for (Message msg : messages) {
+						if (msg == null) {
+							logger.logError("Incoming message is null!");
+							continue;
+						}
 						if (chatPartner != null && chatPartner.equals(msg.from())) {
 							currentDialogue.add(msg);
-							try { sendAsync(new MarkAsSeenRequest(msg.messageId())); } catch (IOException ignored) {}
+							try {
+								sendAsync(new MarkAsSeenRequest(msg.messageId()));
+							} catch (IOException ignored) {
+							}
 							msg.setSeenTime(LocalDateTime.now());
 							redrawChatScreen();
-						} else if (chatPartner == null && (msg.to() == null || msg.to().equals(currentUser))) {
-							System.out.print("\n[New from " + msg.from().name() + "]: " + msg.content().content());
+						} else if (chatPartner == null && (msg.to() == null || msg.to().equals(currentUser.name()))) {
+							System.out.print("\n[New from " + msg.from() + "]: " + msg.content().content());
 							System.out.print("\n> ");
 						}
 					}
@@ -177,7 +196,7 @@ public final class Client {
 					if (chatPartner != null) {
 						Message toRemove = null;
 						for (Message msg : currentDialogue) {
-							if (msg.messageId() < 0 && msg.from().equals(currentUser) && msg.to().equals(chatPartner)) {
+							if (msg.messageId() < 0 && msg.from().equals(currentUser.name()) && (msg.to() == null || msg.to().equals(chatPartner))) {
 								toRemove = msg;
 								break;
 							}
@@ -192,22 +211,26 @@ public final class Client {
 				}
 				case MarkAsSeenResponse(long msgId, LocalDateTime seenTime) -> {
 					for (Message msg : currentDialogue) {
-						if (msg.messageId() == msgId && msg.from().equals(currentUser)) {
+						if (msg.from().equals(currentUser.name()) && msg.messageId() == msgId) {
 							msg.setSeenTime(seenTime);
 							redrawChatScreen();
 							break;
 						}
 					}
 				}
+				case InfoMessage(String msg) -> logger.logInfo("Server Poll: " + msg);
+				case ErrorMessage(String msg) -> logger.logError("Server Poll Error: " + msg);
 				default -> logger.logError("Unexpected poll response: " + response);
 			}
 		}
 
-		public void logout(){
+		public void logout() {
 			try {
 				pollOut.writeObject(new LogoutRequest());
 				pollOut.flush();
-			} catch (IOException e) { logger.logError("Poller Error:", e.getMessage()); }
+			} catch (IOException e) {
+				logger.logError("Poller Error:", e.getMessage());
+			}
 		}
 	}
 
@@ -220,11 +243,11 @@ public final class Client {
 	@SuppressWarnings(value = "BooleanMethodIsAlwaysInverted")
 	private boolean login(String name, String password) throws IOException, InterruptedException {
 		Object resp = sendAndWait(new AuthorisationRequest(name, password));
-		if (resp instanceof AuthorisationResponse(boolean success) && success) {
-			if(poller.authPoll(name, password)){
-				currentUser = new User(name);
+		if (resp instanceof AuthorisationResponse(Integer userId) && userId != -1) {
+			if (poller.authPoll(name, password)) {
+				currentUser = new User(userId, name);
 				System.out.println("Login successful as " + name);
-				System.out.println("Welcome to Messenger Client!");
+				System.out.println("Welcome to Messenger!");
 				System.out.println("Print /help to see commands");
 				showActiveUsers();
 				poller.setDaemon(true);
@@ -261,8 +284,8 @@ public final class Client {
 	 * - Отмечает все непрочитанные сообщения от этого пользователя как прочитанные.
 	 * - Переходит в режим чата (chatPartner = with).
 	 */
-	private void openChat(User with) throws IOException, InterruptedException {
-		if (with.equals(currentUser)) {
+	private void openChat(String with) throws IOException, InterruptedException {
+		if (with.equals(currentUser.name())) {
 			logger.logInfo("You cannot chat with yourself.");
 			return;
 		}
@@ -273,7 +296,7 @@ public final class Client {
 			chatPartner = with;
 
 			for (Message msg : currentDialogue) {
-				if (msg.to() != null && msg.to().equals(currentUser) && msg.from().equals(with) && msg.seenTime() == null) {
+				if (msg.to() != null && msg.to().equals(currentUser.name()) && msg.from().equals(with) && msg.seenTime() == null) {
 					sendAsync(new MarkAsSeenRequest(msg.messageId()));
 					msg.setSeenTime(LocalDateTime.now());
 				}
@@ -290,7 +313,7 @@ public final class Client {
 	private void sendMessageToChat(String text) throws IOException {
 		if (chatPartner == null) return;
 		long tempId = -System.currentTimeMillis();
-		Message tempMsg = new Message(tempId, new MessageContent(text), currentUser, chatPartner, LocalDateTime.now(), null);
+		Message tempMsg = new Message(tempId, new MessageContent(text), currentUser.name(), chatPartner, LocalDateTime.now());
 		currentDialogue.add(tempMsg);
 		redrawChatScreen();
 		sendAsync(new SendMessageRequest(new MessageContent(text), chatPartner));
@@ -317,28 +340,45 @@ public final class Client {
 	private void redrawChatScreen() {
 		if (chatPartner == null) return;
 		clearConsole();
-		System.out.println("=== Chat with " + chatPartner.name() + " ===");
+		System.out.println("=== Chat with " + chatPartner+ " ===");
 		if (currentDialogue.isEmpty()) {
 			System.out.println("No messages yet.");
 		} else {
 			for (Message msg : currentDialogue) {
-				String sender = msg.from().equals(currentUser) ? "You" : msg.from().name();
+				String sender = msg.from().equals(currentUser.name()) ? "You" : msg.from();
 				String time = msg.dispatchTime().format(TIME_FORMATTER);
 
 				if (msg.seenTime() != null) {
 					System.out.printf("[%s>%s] %s: %s%n", time, msg.seenTime().format(TIME_FORMATTER), sender, msg.content().content());
-				}else {
-					if(msg.messageId() < 0)
+				} else {
+					if (msg.messageId() < 0)
 						System.out.printf("[%s>... ] %s: %s%n", time, sender, msg.content().content());
 					else
 						System.out.printf("[%s>sent] %s: %s%n", time, sender, msg.content().content());
 				}
 			}
 		}
+		System.out.print("> ");
 	}
 
 
-	///консоль. спагетти
+	private String getHelp(){
+		return """
+				Commands:\s
+				  /users          - show active users
+				  /chat <name>    - open chat with user
+				  /broadcast <msg> - send message to everyone
+				  /logout         - logout
+				  /exit           - quit client
+				  /logs show      - show logs
+				  /logs clear     - purge logs list
+				  /clear          - clear console window
+				  /help           - see this list
+				""";
+	}
+
+	//TODO переписать это спагетти к чертям
+	/// консоль. спагетти
 	private void console() {
 		Scanner scanner = new Scanner(System.in);
 		boolean exit = false;
@@ -356,7 +396,7 @@ public final class Client {
 						System.out.print("Password: ");
 						String pass = scanner.nextLine().trim();
 						try {
-							if(!login(name, pass))
+							if (!login(name, pass))
 								System.err.println("Invalid username or password");
 						} catch (IOException | InterruptedException e) {
 							logger.logError("Error:", e.getMessage());
@@ -381,24 +421,35 @@ public final class Client {
 					default -> System.out.println("Invalid choice");
 				}
 			} else {
-
 				String input;
 				if (chatPartner == null) {
 					System.out.print("> ");
 					input = scanner.nextLine().trim();
 					if (input.startsWith("/users")) {
-						try {showActiveUsers(); } catch (Exception e) { logger.logError("Error:", e.getMessage()); }
+						try {
+							showActiveUsers();
+						} catch (Exception e) {
+							logger.logError("Error:", e.getMessage());
+						}
 					} else if (input.startsWith("/chat ")) {
 						String target = input.substring(6).trim();
 						if (!target.isEmpty()) {
-							try { openChat(new User(target)); } catch (Exception e) { logger.logError("Error:", e.getMessage()); }
+							try {
+								openChat(target);
+							} catch (Exception e) {
+								logger.logError("Error:", e.getMessage());
+							}
 						} else {
 							System.out.println("Usage: /chat username");
 						}
 					} else if (input.startsWith("/broadcast ")) {
 						String msg = input.substring(11).trim();
 						if (!msg.isEmpty()) {
-							try { broadcast(msg); } catch (IOException e) { logger.logError("Error:", e.getMessage()); }
+							try {
+								broadcast(msg);
+							} catch (IOException e) {
+								logger.logError("Error:", e.getMessage());
+							}
 						}
 					} else if (input.equals("/logs show")) {
 						System.out.println("-=LOGS=-");
@@ -408,19 +459,9 @@ public final class Client {
 						logger.clearLogs();
 					} else if (input.equals("/clear")) {
 						clearConsole();
-					}else if (input.equals("/help")) {
-						System.out.println("\nCommands:");
-						System.out.println("  /users          - show active users");
-						System.out.println("  /chat <name>    - open chat with user");
-						System.out.println("  /broadcast <msg> - send message to everyone");
-						System.out.println("  /logout         - logout");
-						System.out.println("  /exit           - quit client");
-						System.out.println("  /logs show      - show logs");
-						System.out.println("  /logs clear     - purge logs list");
-						System.out.println("  /clear          - clear console window");
-						System.out.println("  /help           - see this list");
-
-					}else if (input.equals("/logout")) {
+					} else if (input.equals("/help")) {
+						System.out.println(getHelp());
+					} else if (input.equals("/logout")) {
 						logout();
 					} else if (input.equals("/exit")) {
 						exit = true;
@@ -428,12 +469,13 @@ public final class Client {
 						System.out.println("Unknown command. Type /users, /chat, /broadcast, /logout, /exit");
 					}
 				} else {
-
-					System.out.print("[c:" + chatPartner.name() + "] > ");
+					System.out.print("[c:" + chatPartner + "] > ");
 					input = scanner.nextLine().trim();
 					if (input.equals("/exit")) {
 						exitChat();
-					} else if (!input.isEmpty()) {
+					} else if(input.equals("/help")){
+						System.out.println(getHelp());
+					}else if (!input.isEmpty()) {
 						try {
 							sendMessageToChat(input);
 						} catch (IOException e) {
@@ -461,16 +503,18 @@ public final class Client {
 		}
 	}
 
-	/**Точка входа
+	/**
+	 * Точка входа
 	 * поддерживаются команды для консольного вызова
-	 * java -jar client.jar [ФЛАГ]
+	 * java -jar client.jar [ФЛАГИ]
 	 * Флаги:
 	 * -i {ip:port} адрес сервера
 	 * -r логин для РЕГИСТРАЦИИ
 	 * -l логин для АВТОРИЗАЦИИ (-r и -l не быть существовать вместе)
 	 * -p пароль для входа
 	 * Далее - терминал управления клиентом
-	 * /help для помощи*/
+	 * /help для помощи
+	 */
 	static void main(String[] args) {
 		// Параметры по умолчанию
 		String host = "127.0.0.1";
@@ -488,7 +532,10 @@ public final class Client {
 						String[] parts = serverArg.split(":");
 						host = parts[0];
 						if (parts.length > 1) {
-							try { port = Integer.parseInt(parts[1]); } catch (NumberFormatException ignored) {}
+							try {
+								port = Integer.parseInt(parts[1]);
+							} catch (NumberFormatException ignored) {
+							}
 						}
 						isIpSet = true;
 					}
@@ -514,7 +561,10 @@ public final class Client {
 				String[] parts = input.split(":");
 				host = parts[0];
 				if (parts.length > 1) {
-					try { port = Integer.parseInt(parts[1]); } catch (NumberFormatException ignored) {}
+					try {
+						port = Integer.parseInt(parts[1]);
+					} catch (NumberFormatException ignored) {
+					}
 				}
 			}
 		}
@@ -530,11 +580,11 @@ public final class Client {
 				if (!client.register(registerName, loginPassword)) {
 					System.err.println("Auto-register failed. Starting manual mode.");
 				}
-			}else if(loginName == null && registerName == null && loginPassword != null){
+			} else if (loginName == null && registerName == null && loginPassword != null) {
 				System.err.println("Can't register only with password.");
-			}else if(loginName != null && registerName != null){
+			} else if (loginName != null && registerName != null) {
 				System.err.println("-l and -r can't use both.");
-			}else if(loginName != null || registerName != null){
+			} else if (loginName != null || registerName != null) {
 				System.err.println("Can't login without password");
 			}
 			client.console();

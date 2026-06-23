@@ -7,11 +7,13 @@ public class Message implements Serializable {
 
 	private final long messageId;
 	private final MessageContent content;
-	private final User from;
-	private final User to;
+	private final String from;
+	private final String to;
 	private final LocalDateTime dispatchTime;
 	private LocalDateTime seenTime;
-	public Message(long messageId, MessageContent content, User from, User to, LocalDateTime dispatchTime, LocalDateTime seenTime){
+	public Message(long messageId, MessageContent content,
+	               String from, String to,
+	               LocalDateTime dispatchTime, LocalDateTime seenTime){
 		this.messageId = messageId;
 		this.content = content;
 		this.from = from;
@@ -20,11 +22,11 @@ public class Message implements Serializable {
 		this.seenTime = seenTime;
 	}
 
-	public Message(long messageId, MessageContent content, User from, User to, LocalDateTime dispatchTime){
+	public Message(long messageId, MessageContent content, String from, String to, LocalDateTime dispatchTime){
 		this(messageId, content, from, to, dispatchTime, null);
 	}
 
-	public Message(long messageId, MessageContent content, User from, User to){
+	public Message(long messageId, MessageContent content, String from, String to){
 		this(messageId, content, from, to, LocalDateTime.now(), null);
 	}
 
@@ -36,11 +38,11 @@ public class Message implements Serializable {
 		return messageId;
 	}
 
-	public User from() {
+	public String from() {
 		return from;
 	}
 
-	public User to() {
+	public String to() {
 		return to;
 	}
 
@@ -58,8 +60,8 @@ public class Message implements Serializable {
 
 	public String toString(){
 		return "id: " + messageId +
-				" from: " + from.name() +
-				" to: " + to.name() +
+				" from: " + from +
+				" to: " + (to == null ? "(broadcast)" : to) +
 				" dispatch: " + dispatchTime +
 				" seen: " + seenTime +
 				" content: " + content;
