@@ -6,6 +6,9 @@ import java.sql.SQLException;
 
 public class DAO_Conf {
 	private static Connection connection = null;
+	/**
+	 * Идентификатор сервера в БД, нужен для регистрации пользователя
+	 * (подключение к конкретному серверу)*/
 	public static int serverId = -1;
 
 	public static Connection getConnection() throws SQLException {
@@ -16,5 +19,9 @@ public class DAO_Conf {
 			connection = DriverManager.getConnection(url, user, password);
 		}
 		return connection;
+	}
+
+	public static void closeConnection() throws SQLException {
+		connection.close();
 	}
 }

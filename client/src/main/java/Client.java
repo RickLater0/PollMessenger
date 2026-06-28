@@ -192,7 +192,7 @@ public final class Client {
 						}
 					}
 				}
-				case SendMessageResponse(int realId) -> {
+				case SendMessageResponse(long realId) -> {
 					if (chatPartner != null) {
 						Message toRemove = null;
 						for (Message msg : currentDialogue) {

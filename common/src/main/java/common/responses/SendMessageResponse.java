@@ -2,5 +2,5 @@ package common.responses;
 
 import java.io.Serializable;
 
-public record SendMessageResponse(int messageId) implements Serializable {
+public record SendMessageResponse(long messageId) implements Serializable {
 }

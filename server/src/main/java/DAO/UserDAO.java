@@ -8,7 +8,7 @@ public class UserDAO {
 
 	public static User getById(int id){
 
-		Connection connection = null;
+		Connection connection;
 		try {
 			connection = DAO_Conf.getConnection();
 		} catch (SQLException e) {
@@ -32,14 +32,9 @@ public class UserDAO {
 		return user;
 	}
 
-	public static User getByName(String name){
+	public static User getByName(String name) throws SQLException {
+		Connection connection = DAO_Conf.getConnection();
 
-		Connection connection = null;
-		try {
-			connection = DAO_Conf.getConnection();
-		} catch (SQLException e) {
-			throw new RuntimeException(e);
-		}
 		var serverId = DAO_Conf.serverId;
 
 		String sql = "select * from users where username = ? AND serverId = ?";
@@ -76,6 +71,35 @@ public class UserDAO {
 					if(rs.next()){
 						user = new User(rs.getInt("userid"), rs.getString("username"));
 					}
+				}
+			}
+		}
+
+		return user;
+	}
+
+	public static User authorise(String name, String passwd) throws  SQLException {
+		var connection = DAO_Conf.getConnection();
+		var serverId = DAO_Conf.serverId;
+		User user = null;
+		String sql = """
+				select
+				    userid,
+				    username,
+				from users
+				where
+				    serverid = ? and
+				    username = ? and
+				    password = crypt(?, gen_salt('bf'))""";
+
+		try(PreparedStatement stmt = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)){
+			stmt.setInt(1, serverId);
+			stmt.setString(2, name);
+			stmt.setString(3, passwd);
+
+			try(ResultSet rs = stmt.executeQuery()){
+				if(rs.next()){
+					user = new User(rs.getInt("userid"), rs.getString("username"));
 				}
 			}
 		}
@@ -120,7 +144,7 @@ public class UserDAO {
 			}
 
 			stmt.setInt(paramIndex++, id);
-			stmt.setInt(paramIndex++, serverId);
+			stmt.setInt(paramIndex, serverId);
 
 			try (ResultSet rs = stmt.executeQuery()) {
 				if (rs.next()) {

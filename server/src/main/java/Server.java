@@ -1,4 +1,6 @@
 import DAO.DAO_Conf;
+import DAO.MessageDAO;
+import DAO.ServerDAO;
 import DAO.UserDAO;
 import common.Logger;
 import common.dto.*;
@@ -42,13 +44,6 @@ public final class Server {
 	public void clearLogs(){
 		logger.clearLogs();
 	}
-
-	/**Подключение к БД*/
-	private Connection connection;
-	/**
-	 * Идентификатор сервера в БД, нужен для регистрации пользователя
-	 * (подключение к конкретному серверу)*/
-	private int serverId = -1;
 
 	/**
 	 * Отображает статус сервера - запущен или нет*/
@@ -106,7 +101,6 @@ public final class Server {
 				case GetNamesRequest() -> getNames();
 				case GetDialogRequest(String with) -> handleDialog(with);
 				case GetMessagesRequest(User from, MessageSeenState state) -> handleGetMessages(from, state);
-				case GetAllMessagesRequest(MessageSeenState state) -> handleGetAllMessages(state);
 				case SendMessageRequest(MessageContent content, String to) -> handleSend(content, to);
 				case MarkAsSeenRequest(long messageId) -> handleMark(messageId);
 				case AuthPollRequest(String name, String passwd) -> handlePollInit(name, passwd);
@@ -173,6 +167,10 @@ public final class Server {
 				sendError("Error: User not authorised");
 				return;
 			}
+			if(!usersByName.containsKey(with)) {
+				sendError("Error: User does not exist: " + with);
+				return;
+			}
 			List<Message> dialog = getDialog(client, with);
 			atomicSend(new GetMessagesResponse(dialog));
 		}
@@ -182,15 +180,15 @@ public final class Server {
 				sendError("Error: User not authorised");
 				return;
 			}
-			atomicSend(new GetMessagesResponse(getMessages(from, client, state)));
-		}
 
-		private void handleGetAllMessages(MessageSeenState state) throws IOException {
-			if (!authorised) {
-				sendError("Error: User not authorised");
+			List<Message> messages = getMessages(from, client, state);
+			if(messages == null) {
+				sendError("Error: No messages found");
+				logger.logError("Couldn't get messages " + client,
+						"Someones id is null");
 				return;
 			}
-			atomicSend(new GetMessagesResponse(getMessages(client, state)));
+			atomicSend(new GetMessagesResponse(messages));
 		}
 
 		private void handleSend(MessageContent content, String to) throws IOException {
@@ -203,11 +201,17 @@ public final class Server {
 				return;
 			}
 
-			Integer mId = sendMessage(content, client.name(), to, LocalDateTime.now());
-			if (mId != null)
-				atomicSendToPoller(new SendMessageResponse(mId));
-			else
-				sendError("Message hasn't been sent: internal error");
+			List<Long> msId = sendMessage(content, client, to, LocalDateTime.now());
+			if(msId == null) {
+				sendError("Could not send message: " + to + ": Server error");
+				return;
+			}
+			for(var mId : msId){
+				if (mId != -1)
+					atomicSendToPoller(new SendMessageResponse(mId));
+				else
+					sendError("Message hasn't been sent: internal error");
+			}
 		}
 
 		private void handlePoll() throws IOException {
@@ -249,9 +253,15 @@ public final class Server {
 					if(!senderQueue.offer(updated))
 						logger.logError("SenderQueue error");
 					atomicSend(new InfoMessage("Message marked as seen"));
-					var chatter = activePollers.stream().filter(cl -> cl.client.name().equals(updated.from())).findAny();
+					var chatter = activePollers.stream().filter(
+							cl -> cl.client.name().equals(updated.from())
+					).findAny();
+
 					chatter.ifPresent(clientHandler ->
-							clientHandler.sendMarkResponse(new MarkAsSeenResponse(updated.messageId(), updated.seenTime())));
+							clientHandler.sendMarkResponse(
+									new MarkAsSeenResponse(updated.messageId(), updated.seenTime())
+							)
+					);
 				}
 			} else {
 				atomicSend(new GetMessagesResponse(List.of()));
@@ -330,10 +340,9 @@ public final class Server {
 		if(running || corrupted)
 			return false;
 		try{
-			dbConnect("jdbc:postgresql://localhost:5432/proglab4", "postgres", "password");
+			dbConnect();
 			registerServer(port);
 			serverSocket = new ServerSocket(port);
-
 
 			running = true;
 			logger.logInfo("Server started on port: " + port);
@@ -368,16 +377,14 @@ public final class Server {
 		return start(BASIC_PORT);
 	}
 
-	/**Подключение к БД
-	 * По сути динамические - можно задавать параметры
-	 * По факту в конструкторе применяется только localhost:5432*/
-	public void dbConnect(String url, String user, String password){
+	/**Подключение к БД*/
+	public void dbConnect(){
 		corrupted = false;
 		try {
-			connection = DAO_Conf.getConnection();
+			DAO_Conf.getConnection();
 			logger.logInfo("DB connected");
 		} catch (SQLException e) {
-			logger.logError("Couldn't connect to DB " + url + ", as user " + user + ".\nUnexpected error occurred", e.getMessage());
+			logger.logError("Couldn't connect to DB" + ".\nUnexpected error occurred", e.getMessage());
 			corrupted = true;
 		}
 	}
@@ -417,7 +424,7 @@ public final class Server {
 		activeClients.clear();
 		activePollers.clear();
 		try {
-			connection.close();
+			DAO_Conf.closeConnection();
 		} catch (SQLException e) {
 			throw new RuntimeException(e);
 		}
@@ -427,38 +434,11 @@ public final class Server {
 	/**Регистрация/авторизация сервера
 	 * Автоматическая подгрузка пользователей с this.serverId = user.serverId*/
 	private void registerServer(int port) throws SQLException {
-		String localIp = getLocalIpAddress();
-		String sql = "INSERT INTO servers (serverIp, port) VALUES (?::inet, ?) " +
-				"ON CONFLICT (serverIp, port) " +
-				"DO UPDATE SET serverIp = EXCLUDED.serverIp, port = EXCLUDED.port RETURNING serverId";
-		try (PreparedStatement stmt = connection.prepareStatement(sql)) {
-			stmt.setString(1, localIp);
-			stmt.setInt(2, port);
-			try(ResultSet rs = stmt.executeQuery()){
-				if (rs.next()) {
-					this.serverId = rs.getInt("serverId");
-					DAO_Conf.serverId = serverId;
-					try(PreparedStatement stmt1 = connection.prepareStatement(
-							"select username, userId from users where serverId = ?")
-					){
-						stmt1.setInt(1, serverId);
-						try(ResultSet rs1 = stmt1.executeQuery()){
-							while(rs1.next()){
-								var name = rs1.getString("username");
-								int userId = rs1.getInt("userId");
-
-								var user = new User(userId, name);
-
-								usersByName.put(name, user);
-								usersById.put(userId, user);
-								logger.logInfo("User fetched " + user.name());
-							}
-						}
-					}
-				} else {
-					throw new SQLException("Failed to get serverId");
-				}
-			}
+		var users = ServerDAO.register(getLocalIpAddress(), port);
+		for(var user : users){
+			usersById.put(user.id(), user);
+			usersByName.put(user.name(), user);
+			logger.logInfo("Fetched user: " + user);
 		}
 	}
 
@@ -486,94 +466,23 @@ public final class Server {
 			logger.logError("Couldn't register user " + name + ".\nUnexpected error occurred", e.getMessage());
 		}
 		return null;
-
-
 	}
 
 	private int authoriseUser(String name, String passwd){
-		String sql = "select userId from users where serverId = ? and username = ? and passwd = crypt(?, passwd)";
-		try(PreparedStatement stmt = connection.prepareStatement(sql)) {
-			stmt.setInt(1, serverId);
-			stmt.setString(2, name);
-			stmt.setString(3, passwd);
-			try(ResultSet rs = stmt.executeQuery()) {
-				if (rs.next()) {
-					int userId = rs.getInt("userId");
-					var usr = new User(userId, name);
-					usersByName.put(name, usr);
-					usersById.put(userId, usr);
-					return userId;
-				}
-			}
+		try{
+			return UserDAO.authorise(name, passwd).id();
+
 		}catch (SQLException e) {
 			logger.logError("Couldn't authorise user " + name + ".\nUnexpected error occurred", e.getMessage());
 		}
 		return -1;
 	}
 
-	private String getSqlMessages(MessageSeenState state, User from){
-		String sql = "select " +
-				"m.messageId, m.content, fromU.username as fromName, toU.username as toName, " +
-				"m.dispatchTime, m.seenTime " +
-				"from messages m " +
-				"left join users fromU on m.fromUser = fromU.userId " +
-				"left join users toU on m.toUser = toU.userId " +
-				"where ";
-		sql += " (m.toUser = ? or m.toUser is null) ";
-
-		if(from != null)
-			sql += " and m.fromUser = ? ";
-		if(state == MessageSeenState.SEEN)
-			sql += " and m.seenTime is not null ";
-		else if(state == MessageSeenState.UNCHECKED)
-			sql += " and m.seenTime is null ";
-		sql += "order by m.dispatchTime";
-		return sql;
-	}
-
-	private Message resultSetToMessage(ResultSet rs) throws SQLException{
-		long id = rs.getLong("messageId");
-		String contentStr = rs.getString("content");
-		String fromName = rs.getString("fromName");
-		String toName = rs.getString("toName");
-		LocalDateTime dispatch = rs.getTimestamp("dispatchTime").toLocalDateTime();
-		Timestamp seenTs = rs.getTimestamp("seenTime");
-		LocalDateTime seen = seenTs != null ? seenTs.toLocalDateTime() : null;
-		MessageContent content = new MessageContent(contentStr);
-
-		return new Message(id, content, fromName, toName, dispatch, seen);
-	}
-
-	private List<Message> getMessages(User to, MessageSeenState state){
-		return getMessages(null, to, state);
-	}
-
 	private List<Message> getMessages(User from, User to, MessageSeenState state){
 		List<Message> resultList = new ArrayList<>();
-		String sql = getSqlMessages(state, from);
-		try (PreparedStatement stmt = connection.prepareStatement(sql)){
-			Integer toId = usersByName.get(to.name()).id();
-			if(toId != null)
-				stmt.setInt(1, toId);
-			else{
-				logger.logError("Couldn't get authorised user " + to.name() + ".");
-				return resultList;
-			}
-			if(from != null){
-				Integer fromId = usersByName.get(from.name()).id();
-				if(fromId != null)
-					stmt.setInt(2, fromId);
-				else{
-					logger.logError("Couldn't get authorised user " + from.name() + ".");
-					return resultList;
-				}
-			}
-			try(ResultSet rs = stmt.executeQuery()){
-				while(rs.next()){
-					resultList.add(resultSetToMessage(rs));
-				}
-			}
-			logger.logInfo("Messages get from " + (from == null ? "(all) " : from.name()) + " to " + to.name());
+		try {
+			resultList = MessageDAO.getMessages(from, to, state);
+			logger.logInfo("Messages get from " +  from.name() + " to " + to.name());
 		} catch (SQLException e) {
 			logger.logError("Couldn't get messages sent to user " + to.name() + ".\nUnexpected error occurred", e.getMessage());
 		}
@@ -613,45 +522,53 @@ public final class Server {
 		}
 	}
 
-	private Integer sendMessage(MessageContent content, String from, String to, LocalDateTime dispatchTime) {
-		String sql = "INSERT INTO messages (content, fromUser, toUser, dispatchTime) VALUES (?, ?, ?, ?)";
-		try (PreparedStatement stmt = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
-			Integer fromId = usersByName.get(from).id();
-			Integer toId = (to == null) ? null : usersByName.get(to).id();
+	private List<Long> sendMessage(
+			MessageContent content,
+			User from,
+			String to,
+			LocalDateTime dispatchTime
+	) {
+		try{
+			List<Long> messagesId = new ArrayList<>();
 
-			if (toId == null && to != null) {
-				logger.logError("Recipient not found: " + to);
-				return null;
-			}
-			if (fromId == null) {
-				logger.logError("Sender not found: " + from);
-				return null;
-			}
+			if(to == null){
+				List<Integer> targetIds = new ArrayList<>();
+				List<User> targetUsers = new ArrayList<>();
 
-			stmt.setString(1, content.content());
-			stmt.setInt(2, fromId);
-			if (toId != null)
-				stmt.setInt(3, toId);
-			else
-				stmt.setNull(3, Types.INTEGER);
-			stmt.setTimestamp(4, Timestamp.valueOf(dispatchTime));
-
-			int affected = stmt.executeUpdate();
-			logger.logInfo("Message from " + from +
-					" to " + (to == null ? "(broadcast)" : to) + " has been sent");
-			if (affected == 1) {
-				try(ResultSet rs = stmt.getGeneratedKeys()){
-					if (rs.next()) {
-						int messageId = rs.getInt(1);
-						deliverMessage(new Message(messageId, content, from, to, dispatchTime));
-						logger.logInfo("Message from " + from +
-								" to " + (to == null ? "(broadcast)" : to) +
-								" with " + messageId + " has been delivered");
-						return messageId;
+				for (User u : usersByName.values()) {
+					if (!u.equals(from)) {
+						targetIds.add(u.id());
+						targetUsers.add(u);
 					}
 				}
+
+				if (targetIds.isEmpty()) return new ArrayList<>();
+
+				List<Long> messagesIds = MessageDAO.insertBroadcast(content, from.id(), targetIds, dispatchTime);
+
+				for (int i = 0; i < targetUsers.size(); i++) {
+					User targetUser = targetUsers.get(i);
+					long msgId = messagesIds.get(i);
+					if(msgId != -1)
+						deliverMessage(new Message(msgId, content, from.name(), targetUser.name(), dispatchTime));
+				}
+
+				return messagesIds;
+			}else {
+				long id = MessageDAO.insert(
+						content,
+						from.id(),
+						usersByName.get(to).id(),
+						dispatchTime
+				);
+				messagesId.add(id);
+				if(id != -1)
+					deliverMessage(new Message(id, content, from.name(), to, dispatchTime));
 			}
-		} catch (SQLException e) {
+
+			return messagesId;
+		}
+		catch (SQLException e) {
 			logger.logError("Couldn't send message from " + from
 					+ " to " + (to == null ? "(broadcast)" : to)
 					+ ".\nUnexpected error occurred", e.getMessage());
@@ -660,55 +577,21 @@ public final class Server {
 	}
 
 	private Message markMessageAsSeen(long messageId){
-		String sql = "update messages set seenTime = ? where messageId = ? returning *";
-		try(PreparedStatement stmt = connection.prepareStatement(sql)){
-			stmt.setTimestamp(1, Timestamp.valueOf(LocalDateTime.now()));
-			stmt.setLong(2, messageId);
-			try (ResultSet rs = stmt.executeQuery()) {
-				if (rs.next()) {
-					String content = rs.getString("content");
-					User from = usersById.get(rs.getInt("fromUser"));
-					User to = usersById.get(rs.getInt("toUser"));
-					LocalDateTime dispatchTime = rs.getTimestamp("dispatchTime").toLocalDateTime();
-					LocalDateTime seenTime = rs.getTimestamp("seenTime").toLocalDateTime();
-					logger.logInfo("Message marked with id " + messageId);
-					return new Message(messageId, new MessageContent(content), from.name(), to.name(), dispatchTime, seenTime);
-				} else {
-					logger.logError("Message with id: " + messageId + " not found");
-				}
-			}
-		}catch(SQLException e){
-			logger.logError("Couldn't mark message " + messageId + " as seen", e.getMessage());
+		try {
+			return MessageDAO.markMessageAsSeen(messageId);
+		} catch (SQLException e) {
+			logger.logError("Could not mark message as seen [id: "+ messageId +" ]", e.getMessage());
+			return null;
 		}
-		return null;
 	}
 
-	private List<Message> getDialog(User me, String with) {
+	private List<Message> getDialog(User first, String second) {
 		List<Message> result = new ArrayList<>();
-		String sql = "SELECT m.messageId, m.content, fromU.username AS fromName, toU.username AS toName, " +
-				"m.dispatchTime, m.seenTime " +
-				"FROM messages m " +
-				"INNER JOIN users fromU ON m.fromUser = fromU.userId " +
-				"LEFT JOIN users toU ON m.toUser = toU.userId " +
-				"WHERE fromU.serverId = ? and toU.serverId = ? and " +
-				"((fromU.username = ? AND (toU.username = ? OR m.toUser is null)) " +
-				"   OR (fromU.username = ? AND (toU.username = ? OR m.toUser is null))) " +
-				"ORDER BY m.dispatchTime";
-		try (PreparedStatement stmt = connection.prepareStatement(sql)) {
-			stmt.setInt(1, DAO_Conf.serverId);
-			stmt.setInt(2, DAO_Conf.serverId);
-			stmt.setString(3, me.name());
-			stmt.setString(4, with);
-			stmt.setString(5, with);
-			stmt.setString(6, me.name());
-			try(ResultSet rs = stmt.executeQuery()){
-				while (rs.next()) {
-					result.add(resultSetToMessage(rs));
-				}
-			}
-			logger.logInfo("Get dialog between " + me.name() + " and " + with);
+		try {
+			result = MessageDAO.getDialog(first.id(), usersByName.get(second).id());
+			logger.logInfo("User " + first +"get dialog with " + second);
 		} catch (SQLException e) {
-			logger.logError("Couldn't get dialog between " + me.name() + " and " + with, e.getMessage());
+			logger.logError("Couldn't get dialog between " + first + " and " + second, e.getMessage());
 		}
 		return result;
 	}
@@ -726,7 +609,6 @@ public final class Server {
 		int choice;
 
 		int port = 43500;
-
 
 		boolean autoStart = false;
 
@@ -746,6 +628,7 @@ public final class Server {
 			server.start(port);
 		}
 
+		//TODO переписать консоль сервера под команды
 		do {
 
 			System.out.println("-SERVER MENU-");
