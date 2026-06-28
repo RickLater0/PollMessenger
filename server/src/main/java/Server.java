@@ -31,7 +31,7 @@ public final class Server {
 	private final Map<Integer, User> usersById = new ConcurrentHashMap<>();
 	/**Очереди сообщений для пользователей*/
 	private final Map<String, BlockingQueue<Message>> messageQueues = new ConcurrentHashMap<>();
-	//TODO реализовать виртуальные потоки
+
 	private final ExecutorService virtualThreadExecutor = Executors.newVirtualThreadPerTaskExecutor();
 
 	/**Основной инструмент, записывающий логи*/
@@ -59,7 +59,7 @@ public final class Server {
 	 * Три состояния: не авторизован, авторизован, авторизован как poller
 	 * (состояние зависит от authorised и в какой коллекции лежит сей продукт)
 	 * */
-	private class ClientHandler extends Thread {
+	private class ClientHandler implements Runnable {
 		private final Socket clientSocket;
 		private User client = null;
 		private boolean authorised = false;
@@ -71,8 +71,6 @@ public final class Server {
 			this.clientSocket = socket;
 			out = new ObjectOutputStream(clientSocket.getOutputStream());
 			in = new ObjectInputStream(clientSocket.getInputStream());
-
-			setDaemon(true);
 		}
 
 		/**Получение объектов общения от клиента
@@ -95,19 +93,24 @@ public final class Server {
 
 		/**Обработка объектов общения-ДТОшек*/
 		private void handle(Object request) throws IOException {
-			switch (request) {
-				case RegistrationRequest(String name, String passwd) -> register(name, passwd);
-				case AuthorisationRequest(String name, String passwd) -> authorise(name, passwd);
-				case GetNamesRequest() -> getNames();
-				case GetDialogRequest(String with) -> handleDialog(with);
-				case GetMessagesRequest(User from, MessageSeenState state) -> handleGetMessages(from, state);
-				case SendMessageRequest(MessageContent content, String to) -> handleSend(content, to);
-				case MarkAsSeenRequest(long messageId) -> handleMark(messageId);
-				case AuthPollRequest(String name, String passwd) -> handlePollInit(name, passwd);
-				case PollRequest() -> handlePoll();
-				case LogoutRequest() -> logout();
-				default -> logger.logError("Unexpected request type");
+			try{
+				switch (request) {
+					case RegistrationRequest(String name, String passwd) -> register(name, passwd);
+					case AuthorisationRequest(String name, String passwd) -> authorise(name, passwd);
+					case GetNamesRequest() -> getNames();
+					case GetDialogRequest(String with) -> handleDialog(with);
+					case GetMessagesRequest(User from, MessageSeenState state) -> handleGetMessages(from, state);
+					case SendMessageRequest(MessageContent content, String to) -> handleSend(content, to);
+					case MarkAsSeenRequest(long messageId) -> handleMark(messageId);
+					case AuthPollRequest(String name, String passwd) -> handlePollInit(name, passwd);
+					case PollRequest() -> handlePoll();
+					case LogoutRequest() -> logout();
+					default -> logger.logError("Unexpected request type");
+				}
+			} catch (Exception e) {
+				logger.logError("Unexpected error in client handler: ", e.getMessage());
 			}
+
 		}
 
 		/*Далее названия функций говорят сами за себя*/
@@ -138,6 +141,7 @@ public final class Server {
 
 		private void authorise(String name, String passwd) throws IOException {
 			int userId = authoriseUser(name, passwd);
+			logger.logInfo("Authorised: " + (userId != -1 ? userId : "unknown"));
 			atomicSend(new AuthorisationResponse(userId));
 			if (userId != -1) {
 				logger.logInfo("User authorised: " + name);
@@ -159,7 +163,7 @@ public final class Server {
 									.toList()
 					)
 			);
-			logger.logInfo("User " + client + " got active names");
+			logger.logInfo(client + " got active names");
 		}
 
 		private void handleDialog(String with) throws IOException {
@@ -332,8 +336,6 @@ public final class Server {
 			if (running) stop();
 		}));
 	}
-	/**Поток - acceptor: принимает пользователей*/
-	private Thread main;
 
 	/**Запуск сервера на порту port*/
 	public boolean start(int port){
@@ -346,11 +348,11 @@ public final class Server {
 
 			running = true;
 			logger.logInfo("Server started on port: " + port);
-			main = new Thread(() -> {
+			virtualThreadExecutor.submit(() -> {
 				while (running && !serverSocket.isClosed()) {
 					try {
 						var ch = new ClientHandler(serverSocket.accept());
-						ch.start();
+						virtualThreadExecutor.submit(ch);
 					} catch (SocketException e) {
 						if (running) {
 							logger.logError("Socket closed unexpectedly", e.getMessage());
@@ -361,7 +363,6 @@ public final class Server {
 					}
 				}
 			});
-			main.start();
 			return true;
 
 		} catch (IOException | SQLException e){
@@ -395,6 +396,8 @@ public final class Server {
 		if(!running || corrupted)
 			return false;
 
+		running = false;
+
 		for(var client : activeClients){
 			try {
 				client.sendInfo("Server is closing");
@@ -408,21 +411,28 @@ public final class Server {
 			poller.logout();
 		}
 
-		running = false;
 		try {
 			serverSocket.close();
-			if(main != null)
-				try {
-					main.join(2000);
-				} catch (InterruptedException e) {
-					Thread.currentThread().interrupt();
-				}
 		} catch (IOException e) {
 			logger.logError("Couldn't stop server.\nUnexpected error occurred", e.getMessage());
 			return false;
 		}
+
+		virtualThreadExecutor.shutdown();
+		try {
+			if (!virtualThreadExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+				virtualThreadExecutor.shutdownNow();
+			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			virtualThreadExecutor.shutdownNow();
+		}
+
 		activeClients.clear();
 		activePollers.clear();
+		usersByName.clear();
+		usersById.clear();
+
 		try {
 			DAO_Conf.closeConnection();
 		} catch (SQLException e) {
@@ -470,7 +480,10 @@ public final class Server {
 
 	private int authoriseUser(String name, String passwd){
 		try{
-			return UserDAO.authorise(name, passwd).id();
+			var user = UserDAO.authorise(name, passwd);
+			if(user != null)
+				return user.id();
+			return -1;
 
 		}catch (SQLException e) {
 			logger.logError("Couldn't authorise user " + name + ".\nUnexpected error occurred", e.getMessage());

@@ -58,7 +58,7 @@ public class UserDAO {
 		var connection = DAO_Conf.getConnection();
 		var serverId = DAO_Conf.serverId;
 		User user = null;
-		String sql = "insert into users (username, password, serverid) values (?, crypt(?, gen_salt('bf')), ?)";
+		String sql = "insert into users (username, passwd, serverid) values (?, crypt(?, gen_salt('bf')), ?)";
 		
 		try(PreparedStatement stmt = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)){
 			stmt.setString(1, name);
@@ -78,19 +78,18 @@ public class UserDAO {
 		return user;
 	}
 
-	public static User authorise(String name, String passwd) throws  SQLException {
+	public static User authorise(String name, String passwd) throws SQLException {
 		var connection = DAO_Conf.getConnection();
 		var serverId = DAO_Conf.serverId;
-		User user = null;
 		String sql = """
 				select
 				    userid,
-				    username,
+				    username
 				from users
 				where
 				    serverid = ? and
 				    username = ? and
-				    password = crypt(?, gen_salt('bf'))""";
+				    passwd = crypt(?, passwd)""";
 
 		try(PreparedStatement stmt = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)){
 			stmt.setInt(1, serverId);
@@ -99,12 +98,12 @@ public class UserDAO {
 
 			try(ResultSet rs = stmt.executeQuery()){
 				if(rs.next()){
-					user = new User(rs.getInt("userid"), rs.getString("username"));
+					return new User(rs.getInt("userid"), rs.getString("username"));
 				}
 			}
 		}
 
-		return user;
+		return null;
 	}
 
 	public static User update(int id, String name, String passwd) throws SQLException {

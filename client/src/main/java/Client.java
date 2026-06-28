@@ -126,7 +126,11 @@ public final class Client {
 	private boolean register(String name, String password) throws IOException, InterruptedException {
 		Object resp = sendAndWait(new RegistrationRequest(name, password));
 		if (resp instanceof AuthorisationResponse(Integer userId)) {
-			return userId != -1;
+			var success = userId != -1;
+			if(success){
+				login(name, password);
+			}
+			return success;
 		}
 		return false;
 	}
@@ -378,7 +382,7 @@ public final class Client {
 	}
 
 	//TODO переписать это спагетти к чертям
-	/// консоль. спагетти
+	//// консоль спагетти
 	private void console() {
 		Scanner scanner = new Scanner(System.in);
 		boolean exit = false;
