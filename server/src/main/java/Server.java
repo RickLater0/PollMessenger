@@ -88,7 +88,7 @@ public final class Server {
 					handle(request);
 				}
 			} catch (EOFException | SocketException e) {
-				logger.logInfo("Client disconnected: " + (client != null ? client : "unknown"));
+				logger.logInfo("Disconnected: " + (client != null ? client : "unknown") + " due to exception: " + e.getMessage());
 			} catch (IOException | ClassNotFoundException e) {
 				logger.logError("Unexpected error in client handler: ", e.getMessage());
 			} finally {
@@ -299,7 +299,7 @@ public final class Server {
 				removeQueueForUser(client);
 				activeClients.remove(this);
 				activePollers.remove(this);
-				logger.logInfo("User disconnected: " + client.name());
+				logger.logInfo("Disconnected: " + client.name());
 			}
 		}
 
@@ -572,7 +572,7 @@ public final class Server {
 						deliverMessage(new Message(msgId, content, from.name(), target.name(), dispatchTime));
 				}
 
-				return (ArrayList<Long>) messages.values();
+				return new ArrayList<>(messages.values());
 			}else {
 				long id = MessageDAO.insert(
 						content,
