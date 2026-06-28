@@ -9,7 +9,7 @@ public class DAO_Conf {
 	/**
 	 * Идентификатор сервера в БД, нужен для регистрации пользователя
 	 * (подключение к конкретному серверу)*/
-	public static int serverId = -1;
+	public static long serverId = -1;
 
 	public static Connection getConnection() throws SQLException {
 		if(connection == null){

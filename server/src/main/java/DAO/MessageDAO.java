@@ -8,7 +8,9 @@ import common.dto.User;
 import java.sql.*;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class MessageDAO {
 
@@ -27,8 +29,8 @@ public class MessageDAO {
 
 	public static long insert(
 			MessageContent content,
-			Integer from,
-			Integer to,
+			Long from,
+			Long to,
 			LocalDateTime dispatchTime
 	) throws SQLException {
 		String sql = """
@@ -40,9 +42,9 @@ public class MessageDAO {
 		try (PreparedStatement stmt = DAO_Conf.getConnection().prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
 
 			stmt.setString(1, content.content());
-			stmt.setInt(2, from);
+			stmt.setLong(2, from);
 			if (to != null)
-				stmt.setInt(3, to);
+				stmt.setLong(3, to);
 			else
 				stmt.setNull(3, Types.INTEGER);
 			stmt.setTimestamp(4, Timestamp.valueOf(dispatchTime));
@@ -58,10 +60,9 @@ public class MessageDAO {
 		return -1;
 	}
 
-	public static List<Long> insertBroadcast(
+	public static Map<User, Long> insertBroadcast(
 			MessageContent content,
-			int fromId,
-			List<Integer> targetUserIds,
+			long fromId,
 			LocalDateTime dispatchTime
 	) throws SQLException {
 		String sql = """
@@ -71,14 +72,15 @@ public class MessageDAO {
             (?, ?, ?, ?)
         """;
 
-		List<Long> generatedIds = new ArrayList<>();
+		Map<User, Long> generatedIds = new HashMap<>();
 
 		try (PreparedStatement stmt = DAO_Conf.getConnection().prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
 
-			for (var toId : targetUserIds) {
+			var targets = UserDAO.getAllExcept(fromId);
+			for (var target : targets) {
 				stmt.setString(1, content.content());
-				stmt.setInt(2, fromId);
-				stmt.setInt(3, toId);
+				stmt.setLong(2, fromId);
+				stmt.setLong(3, target.id());
 				stmt.setTimestamp(4, Timestamp.valueOf(dispatchTime));
 				stmt.addBatch();
 			}
@@ -86,11 +88,12 @@ public class MessageDAO {
 			stmt.executeBatch();
 
 			try (ResultSet rs = stmt.getGeneratedKeys()) {
+				int i = 0;
 				while (rs.next()) {
-					generatedIds.add(rs.getLong(1)); // В PostgreSQL это вернет ID в порядке вставки
+					generatedIds.put(targets.get(i), rs.getLong(1)); // В PostgreSQL это вернет ID в порядке вставки
+					i++;
 				}
 			}
-
 		}
 		return generatedIds;
 	}
@@ -194,15 +197,15 @@ public class MessageDAO {
 		ArrayList<Message> messages = new ArrayList<>();
 
 		try (PreparedStatement stmt = DAO_Conf.getConnection().prepareStatement(sql)){
-			Integer toId = to.id();
+			Long toId = to.id();
 			if(toId != null)
-				stmt.setInt(1, toId);
+				stmt.setLong(1, toId);
 			else
 				return null;
 
-			Integer fromId = from.id();
+			Long fromId = from.id();
 			if(fromId != null)
-				stmt.setInt(2, fromId);
+				stmt.setLong(2, fromId);
 			else
 				return null;
 

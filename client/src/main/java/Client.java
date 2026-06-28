@@ -1,11 +1,17 @@
 import common.Logger;
-import common.dto.*;
+import common.dto.Message;
+import common.dto.MessageContent;
+import common.dto.User;
+import common.messages.ErrorMessage;
+import common.messages.InfoMessage;
 import common.requests.*;
 import common.responses.*;
-import common.messages.*;
 
-import java.net.*;
-import java.io.*;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.net.Socket;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
@@ -63,7 +69,7 @@ public final class Client {
 				if(response instanceof InfoMessage(String msg))
 					logger.logInfo("Server - " + msg);
 				else if(response instanceof ErrorMessage(String msg))
-					logger.logInfo("Server ERROR - " + msg);
+					logger.logError("Server ERROR - " + msg);
 				else {
 					if (!incomingResponses.offer(response))
 						logger.logError("Couldn't offer");
@@ -125,7 +131,7 @@ public final class Client {
 
 	private boolean register(String name, String password) throws IOException, InterruptedException {
 		Object resp = sendAndWait(new RegistrationRequest(name, password));
-		if (resp instanceof AuthorisationResponse(Integer userId)) {
+		if (resp instanceof AuthorisationResponse(Long userId)) {
 			var success = userId != -1;
 			if(success){
 				login(name, password);
@@ -247,7 +253,7 @@ public final class Client {
 	@SuppressWarnings(value = "BooleanMethodIsAlwaysInverted")
 	private boolean login(String name, String password) throws IOException, InterruptedException {
 		Object resp = sendAndWait(new AuthorisationRequest(name, password));
-		if (resp instanceof AuthorisationResponse(Integer userId) && userId != -1) {
+		if (resp instanceof AuthorisationResponse(Long userId) && userId != -1) {
 			if (poller.authPoll(name, password)) {
 				currentUser = new User(userId, name);
 				System.out.println("Login successful as " + name);
@@ -268,13 +274,13 @@ public final class Client {
 	 */
 	private void showActiveUsers() throws IOException, InterruptedException {
 		Object resp = sendAndWait(new GetNamesRequest());
-		if (resp instanceof GetNamesResponse(List<User> users)) {
+		if (resp instanceof GetNamesResponse(List<String> users)) {
 			if (users.isEmpty()) {
 				System.out.println("No other active users.");
 			} else {
 				System.out.println("Active users:");
 				for (int i = 0; i < users.size(); i++) {
-					System.out.println((i + 1) + ". " + users.get(i).name());
+					System.out.println((i + 1) + ". " + users.get(i));
 				}
 			}
 		} else if (resp instanceof ErrorMessage(String message)) {
@@ -295,6 +301,11 @@ public final class Client {
 		}
 		Object resp = sendAndWait(new GetDialogRequest(with));
 		if (resp instanceof GetMessagesResponse(List<Message> dialog)) {
+			if (dialog == null) {
+				System.out.println("No messages found. Probably a typo in username");
+				logger.logInfo("No messages found. Probably a typo in username");
+				return;
+			}
 			currentDialogue.clear();
 			currentDialogue.addAll(dialog);
 			chatPartner = with;
@@ -386,7 +397,6 @@ public final class Client {
 	private void console() {
 		Scanner scanner = new Scanner(System.in);
 		boolean exit = false;
-
 
 		while (!exit && running) {
 			if (currentUser == null) {

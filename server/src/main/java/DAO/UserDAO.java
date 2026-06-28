@@ -3,6 +3,8 @@ package DAO;
 import common.dto.User;
 
 import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
 
 public class UserDAO {
 
@@ -19,11 +21,11 @@ public class UserDAO {
 		String sql = "select * from users where id = ? AND serverId = ?";
 		User user = null;
 		try(PreparedStatement stmt = connection.prepareStatement(sql)){
-			stmt.setInt(1, id);
-			stmt.setInt(2, serverId);
+			stmt.setLong(1, id);
+			stmt.setLong(2, serverId);
 			try(ResultSet rs = stmt.executeQuery()){
 				if(rs.next()){
-					user = new User(rs.getInt("userid"), rs.getString("username"));
+					user = new User(rs.getLong("userid"), rs.getString("username"));
 				}
 			}
 		} catch (SQLException e) {
@@ -41,10 +43,10 @@ public class UserDAO {
 		User user = null;
 		try(PreparedStatement stmt = connection.prepareStatement(sql)){
 			stmt.setString(1, name);
-			stmt.setInt(2, serverId);
+			stmt.setLong(2, serverId);
 			try(ResultSet rs = stmt.executeQuery()){
 				if(rs.next()){
-					user = new User(rs.getInt("userid"), rs.getString("username"));
+					user = new User(rs.getLong("userid"), rs.getString("username"));
 				}
 			}
 		} catch (SQLException e) {
@@ -63,13 +65,13 @@ public class UserDAO {
 		try(PreparedStatement stmt = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)){
 			stmt.setString(1, name);
 			stmt.setString(2, passwd);
-			stmt.setInt(3, serverId);
+			stmt.setLong(3, serverId);
 
 			int affected = stmt.executeUpdate();
 			if(affected == 1){
 				try (ResultSet rs = stmt.getGeneratedKeys()){
 					if(rs.next()){
-						user = new User(rs.getInt("userid"), rs.getString("username"));
+						user = new User(rs.getLong("userid"), rs.getString("username"));
 					}
 				}
 			}
@@ -89,21 +91,72 @@ public class UserDAO {
 				where
 				    serverid = ? and
 				    username = ? and
-				    passwd = crypt(?, passwd)""";
+				    passwd = crypt(?, passwd)
+				""";
 
 		try(PreparedStatement stmt = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)){
-			stmt.setInt(1, serverId);
+			stmt.setLong(1, serverId);
 			stmt.setString(2, name);
 			stmt.setString(3, passwd);
 
 			try(ResultSet rs = stmt.executeQuery()){
 				if(rs.next()){
-					return new User(rs.getInt("userid"), rs.getString("username"));
+					return new User(rs.getLong("userid"), rs.getString("username"));
 				}
 			}
 		}
 
 		return null;
+	}
+
+	public static List<User> getAll() throws SQLException {
+		var connection = DAO_Conf.getConnection();
+		var serverId = DAO_Conf.serverId;
+
+		String sql = """
+				select
+				    *
+				from users
+				where
+				    serverid = ?
+				""";
+
+		try (PreparedStatement stmt = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+			stmt.setLong(1, serverId);
+			try (ResultSet rs = stmt.executeQuery()) {
+				List<User> users = new ArrayList<>();
+				while (rs.next()) {
+					users.add(new User(rs.getLong("userid"), rs.getString("username")));
+				}
+				return users;
+			}
+		}
+	}
+
+	public static List<User> getAllExcept(Long exceptId) throws SQLException {
+		var connection = DAO_Conf.getConnection();
+		var serverId = DAO_Conf.serverId;
+
+		String sql = """
+				select
+				    *
+				from users
+				where
+				    serverid = ? and
+				    userid != ?
+				""";
+
+		try (PreparedStatement stmt = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+			stmt.setLong(1, serverId);
+			stmt.setLong(2, exceptId);
+			try (ResultSet rs = stmt.executeQuery()) {
+				List<User> users = new ArrayList<>();
+				while (rs.next()) {
+					users.add(new User(rs.getLong("userid"), rs.getString("username")));
+				}
+				return users;
+			}
+		}
 	}
 
 	public static User update(int id, String name, String passwd) throws SQLException {
@@ -142,12 +195,12 @@ public class UserDAO {
 				stmt.setString(paramIndex++, passwd);
 			}
 
-			stmt.setInt(paramIndex++, id);
-			stmt.setInt(paramIndex, serverId);
+			stmt.setLong(paramIndex++, id);
+			stmt.setLong(paramIndex, serverId);
 
 			try (ResultSet rs = stmt.executeQuery()) {
 				if (rs.next()) {
-					return new User(rs.getInt("userid"), rs.getString("username"));
+					return new User(rs.getLong("userid"), rs.getString("username"));
 				}
 			}
 

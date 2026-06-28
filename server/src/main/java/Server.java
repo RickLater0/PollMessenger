@@ -3,18 +3,27 @@ import DAO.MessageDAO;
 import DAO.ServerDAO;
 import DAO.UserDAO;
 import common.Logger;
-import common.dto.*;
-import common.messages.*;
+import common.dto.Message;
+import common.dto.MessageContent;
+import common.dto.MessageSeenState;
+import common.dto.User;
+import common.messages.ErrorMessage;
+import common.messages.InfoMessage;
 import common.requests.*;
 import common.responses.*;
 
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.net.*;
-import java.io.*;
+import java.sql.SQLException;
 import java.time.LocalDateTime;
-import java.util.*;
-import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Scanner;
 import java.util.concurrent.*;
-
 
 public final class Server {
 
@@ -25,10 +34,6 @@ public final class Server {
 	private final List<ClientHandler> activeClients = new CopyOnWriteArrayList<>();
 	/**Действующие poller-сокеты*/
 	private final List<ClientHandler> activePollers = new CopyOnWriteArrayList<>();
-	/**Имя-идентификатор в базе для пользователей*/
-	private final Map<String, User> usersByName = new ConcurrentHashMap<>();
-	/**Идентификатор-имя в базе для пользователей*/
-	private final Map<Integer, User> usersById = new ConcurrentHashMap<>();
 	/**Очереди сообщений для пользователей*/
 	private final Map<String, BlockingQueue<Message>> messageQueues = new ConcurrentHashMap<>();
 
@@ -140,7 +145,7 @@ public final class Server {
 		}
 
 		private void authorise(String name, String passwd) throws IOException {
-			int userId = authoriseUser(name, passwd);
+			long userId = authoriseUser(name, passwd);
 			logger.logInfo("Authorised: " + (userId != -1 ? userId : "unknown"));
 			atomicSend(new AuthorisationResponse(userId));
 			if (userId != -1) {
@@ -154,15 +159,15 @@ public final class Server {
 				sendError("Error: User not authorised");
 				return;
 			}
-			atomicSend(
-					new GetNamesResponse(
-							usersById.values().stream().filter(
-									user ->
-											user != null && !user.equals(client)
-									)
-									.toList()
-					)
-			);
+			try {
+				atomicSend(
+						new GetNamesResponse(
+								UserDAO.getAllExcept(client.id()).stream().map(User::name).toList()
+						)
+				);
+			} catch (SQLException e) {
+				logger.logError("Couldn't get users", e.getMessage());
+			}
 			logger.logInfo(client + " got active names");
 		}
 
@@ -171,12 +176,19 @@ public final class Server {
 				sendError("Error: User not authorised");
 				return;
 			}
-			if(!usersByName.containsKey(with)) {
-				sendError("Error: User does not exist: " + with);
-				return;
+			try {
+				var second = UserDAO.getByName(with);
+				if (second == null) {
+					sendError("Error: User does not exist: " + with);
+					atomicSend(new GetMessagesResponse(null));
+					return;
+				}
+				List<Message> dialog = getDialog(client, second);
+				atomicSend(new GetMessagesResponse(dialog));
+			} catch (SQLException e) {
+				sendError("Error: Could not get dialog with: " + with);
 			}
-			List<Message> dialog = getDialog(client, with);
-			atomicSend(new GetMessagesResponse(dialog));
+
 		}
 
 		private void handleGetMessages(User from, MessageSeenState state) throws IOException {
@@ -200,21 +212,27 @@ public final class Server {
 				sendError("Error: User not authorised");
 				return;
 			}
-			if (to != null && !usersByName.containsKey(to)) {
-				sendError("Recipient not found: " + to);
-				return;
-			}
+			try {
+				var recipient = UserDAO.getByName(to);
 
-			List<Long> msId = sendMessage(content, client, to, LocalDateTime.now());
-			if(msId == null) {
-				sendError("Could not send message: " + to + ": Server error");
-				return;
-			}
-			for(var mId : msId){
-				if (mId != -1)
-					atomicSendToPoller(new SendMessageResponse(mId));
-				else
-					sendError("Message hasn't been sent: internal error");
+				if (to != null && recipient == null) {
+					sendError("Recipient not found: " + to);
+					return;
+				}
+
+				List<Long> msId = sendMessage(content, client, recipient, LocalDateTime.now());
+				if (msId == null) {
+					sendError("Could not send message. Server error");
+					return;
+				}
+				for (var mId : msId) {
+					if (mId != -1)
+						atomicSendToPoller(new SendMessageResponse(mId));
+					else
+						sendError("Message hasn't been sent: internal error");
+				}
+			} catch (SQLException e) {
+				throw new RuntimeException(e);
 			}
 		}
 
@@ -237,7 +255,7 @@ public final class Server {
 		}
 
 		private void handlePollInit(String name, String passwd) throws IOException {
-			int userId = authoriseUser(name, passwd);
+			long userId = authoriseUser(name, passwd);
 			atomicSend(new AuthPollResponse(userId != -1));
 			if (userId != -1) {
 				logger.logInfo("Poller authorised: " + name);
@@ -339,8 +357,14 @@ public final class Server {
 
 	/**Запуск сервера на порту port*/
 	public boolean start(int port){
-		if(running || corrupted)
+		if (running) {
+			logger.logInfo("Server is already running");
 			return false;
+		}
+		if (corrupted) {
+			logger.logError("Server is corrupted");
+			return false;
+		}
 		try{
 			dbConnect();
 			registerServer(port);
@@ -430,8 +454,6 @@ public final class Server {
 
 		activeClients.clear();
 		activePollers.clear();
-		usersByName.clear();
-		usersById.clear();
 
 		try {
 			DAO_Conf.closeConnection();
@@ -446,8 +468,6 @@ public final class Server {
 	private void registerServer(int port) throws SQLException {
 		var users = ServerDAO.register(getLocalIpAddress(), port);
 		for(var user : users){
-			usersById.put(user.id(), user);
-			usersByName.put(user.name(), user);
 			logger.logInfo("Fetched user: " + user);
 		}
 	}
@@ -467,8 +487,6 @@ public final class Server {
 		try{
 			var user = UserDAO.insert(name, passwd);
 			if(user != null){
-				usersByName.put(user.name(), user);
-				usersById.put(user.id(), user);
 				logger.logInfo("New user registered " + user.name());
 			}
 			return user;
@@ -478,7 +496,7 @@ public final class Server {
 		return null;
 	}
 
-	private int authoriseUser(String name, String passwd){
+	private long authoriseUser(String name, String passwd) {
 		try{
 			var user = UserDAO.authorise(name, passwd);
 			if(user != null)
@@ -538,45 +556,33 @@ public final class Server {
 	private List<Long> sendMessage(
 			MessageContent content,
 			User from,
-			String to,
+			User to,
 			LocalDateTime dispatchTime
 	) {
 		try{
 			List<Long> messagesId = new ArrayList<>();
 
 			if(to == null){
-				List<Integer> targetIds = new ArrayList<>();
-				List<User> targetUsers = new ArrayList<>();
 
-				for (User u : usersByName.values()) {
-					if (!u.equals(from)) {
-						targetIds.add(u.id());
-						targetUsers.add(u);
-					}
-				}
+				Map<User, Long> messages = MessageDAO.insertBroadcast(content, from.id(), dispatchTime);
 
-				if (targetIds.isEmpty()) return new ArrayList<>();
-
-				List<Long> messagesIds = MessageDAO.insertBroadcast(content, from.id(), targetIds, dispatchTime);
-
-				for (int i = 0; i < targetUsers.size(); i++) {
-					User targetUser = targetUsers.get(i);
-					long msgId = messagesIds.get(i);
+				for (User target : messages.keySet()) {
+					long msgId = messages.get(target);
 					if(msgId != -1)
-						deliverMessage(new Message(msgId, content, from.name(), targetUser.name(), dispatchTime));
+						deliverMessage(new Message(msgId, content, from.name(), target.name(), dispatchTime));
 				}
 
-				return messagesIds;
+				return (List<Long>) messages.values();
 			}else {
 				long id = MessageDAO.insert(
 						content,
 						from.id(),
-						usersByName.get(to).id(),
+						to.id(),
 						dispatchTime
 				);
 				messagesId.add(id);
 				if(id != -1)
-					deliverMessage(new Message(id, content, from.name(), to, dispatchTime));
+					deliverMessage(new Message(id, content, from.name(), to.name(), dispatchTime));
 			}
 
 			return messagesId;
@@ -598,10 +604,10 @@ public final class Server {
 		}
 	}
 
-	private List<Message> getDialog(User first, String second) {
+	private List<Message> getDialog(User first, User second) {
 		List<Message> result = new ArrayList<>();
 		try {
-			result = MessageDAO.getDialog(first.id(), usersByName.get(second).id());
+			result = MessageDAO.getDialog(first.id(), second.id());
 			logger.logInfo("User " + first +"get dialog with " + second);
 		} catch (SQLException e) {
 			logger.logError("Couldn't get dialog between " + first + " and " + second, e.getMessage());
@@ -616,6 +622,7 @@ public final class Server {
 	 * -p {число} порт, на котором запустится сервер (-s не обязателен)
 	 * -s флаг для запуска сервера
 	 * Вызов меню управления сервером*/
+
 	static void main(String[] args){
 		Server server = new Server();
 		Scanner scanner = new Scanner(System.in);
@@ -640,7 +647,6 @@ public final class Server {
 		if(autoStart){
 			server.start(port);
 		}
-
 		//TODO переписать консоль сервера под команды
 		do {
 
