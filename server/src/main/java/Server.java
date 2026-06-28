@@ -572,7 +572,7 @@ public final class Server {
 						deliverMessage(new Message(msgId, content, from.name(), target.name(), dispatchTime));
 				}
 
-				return (List<Long>) messages.values();
+				return (ArrayList<Long>) messages.values();
 			}else {
 				long id = MessageDAO.insert(
 						content,
