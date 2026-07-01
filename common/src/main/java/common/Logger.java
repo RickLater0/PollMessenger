@@ -46,7 +46,7 @@ public class Logger {
 			String time = timestamp.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"));
 			if (!isColorSupported()) {
 				return String.format("[%s] %s: %s%s", time, level, message,
-						(stackTrace != null ? "\n" + stackTrace : ""));
+						(stackTrace != null ? "\n\t" + stackTrace : ""));
 			}
 			var messageC = CColors.WHITE;
 			var resetC = CColors.RESET;
@@ -57,7 +57,7 @@ public class Logger {
 				case DEBUG -> messageC = CColors.BOLD_GREEN;
 			}
 			if (stackTrace != null && !stackTrace.isEmpty()) {
-				return String.format("[%s] %s%s%s: %s\n%s", time, messageC, level, resetC, message, stackTrace);
+				return String.format("[%s] %s%s%s: %s\n\t%s", time, messageC, level, resetC, message, stackTrace);
 			}
 			return String.format("[%s] %s%s%s: %s", time, messageC, level, resetC, message);
 		}
@@ -77,8 +77,12 @@ public class Logger {
 
 	private final List<LogEntry> logs = new CopyOnWriteArrayList<>();
 
+	private void logLevel(LogLevel level, String message) {
+		logs.add(new LogEntry(level, message));
+	}
+
 	public void logInfo(String info){
-		logs.add(new LogEntry(LogLevel.INFO, info));
+		logLevel(LogLevel.INFO, info);
 	}
 
 	public void logError(String info, String err){
@@ -86,7 +90,15 @@ public class Logger {
 	}
 
 	public void logError(String info){
-		logs.add(new LogEntry(LogLevel.ERROR, info));
+		logLevel(LogLevel.ERROR, info);
+	}
+
+	public void logWarning(String info) {
+		logLevel(LogLevel.WARNING, info);
+	}
+
+	public void logDebug(String info) {
+		logLevel(LogLevel.DEBUG, info);
 	}
 
 	public String showLogs(){
@@ -97,16 +109,55 @@ public class Logger {
 		return res.toString().isBlank() ? "NO LOGS" : res.toString();
 	}
 
+	public String showInfoLogs() {
+		return showCertainLogs(LogLevel.INFO);
+	}
+
+	public String showErrorLogs() {
+		return showCertainLogs(LogLevel.ERROR);
+	}
+
+	public String showWarningLogs() {
+		return showCertainLogs(LogLevel.WARNING);
+	}
+
+	public String showDebugLogs() {
+		return showCertainLogs(LogLevel.DEBUG);
+	}
+
+	private String showCertainLogs(LogLevel level) {
+		StringBuilder res = new StringBuilder();
+		for (var entry : logs) {
+			if (entry.level == level) res.append(entry.format()).append("\n");
+		}
+		return res.toString().isBlank() ? ("NO " + level + " LOGS") : res.toString();
+	}
+
+	public String getLastLog() {
+		return logs.getLast().format();
+	}
+
 	public void clearLogs(){
 		logs.clear();
 	}
-
 	public void clearInfo(){
 		logs.removeIf(log -> log.level == LogLevel.INFO);
 	}
-
 	public void clearErrors(){
 		logs.removeIf(log -> log.level == LogLevel.ERROR);
+	}
+
+	public void clearDebug() {
+		logs.removeIf(log -> log.level == LogLevel.DEBUG);
+	}
+
+	public void clearWarnings() {
+		logs.removeIf(log -> log.level == LogLevel.WARNING);
+	}
+
+	private void clearCertainLogs(LogLevel level) {
+		logs.removeIf(log -> log.level == level);
+
 	}
 }
 

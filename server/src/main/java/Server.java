@@ -19,10 +19,7 @@ import java.io.ObjectOutputStream;
 import java.net.*;
 import java.sql.SQLException;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.Scanner;
+import java.util.*;
 import java.util.concurrent.*;
 
 public final class Server {
@@ -50,6 +47,8 @@ public final class Server {
 		logger.clearLogs();
 	}
 
+	private boolean verbose = false;
+	
 	/**
 	 * Отображает статус сервера - запущен или нет*/
 	private boolean running;
@@ -66,7 +65,9 @@ public final class Server {
 	 * */
 	private class ClientHandler implements Runnable {
 		private final Socket clientSocket;
+
 		private User client = null;
+
 		private boolean authorised = false;
 
 		private final ObjectOutputStream out;
@@ -75,6 +76,7 @@ public final class Server {
 		public ClientHandler(Socket socket) throws IOException {
 			this.clientSocket = socket;
 			out = new ObjectOutputStream(clientSocket.getOutputStream());
+			out.flush();
 			in = new ObjectInputStream(clientSocket.getInputStream());
 		}
 
@@ -88,9 +90,14 @@ public final class Server {
 					handle(request);
 				}
 			} catch (EOFException | SocketException e) {
-				logger.logInfo("Disconnected: " + (client != null ? client : "unknown") + " due to exception: " + e.getMessage());
+				logInfo("Disconnected: " + (client != null ? client : "unknown") + " due to exception: " + e.getMessage());
 			} catch (IOException | ClassNotFoundException e) {
-				logger.logError("Unexpected error in client handler: ", e.getMessage());
+				String msg = e.getMessage();
+				if (msg != null && (msg.contains("Connection reset") || msg.contains("Broken pipe"))) {
+					logInfo("Disconnected (RST): " + (client != null ? client : "unknown"));
+				} else {
+					logError("Unexpected error in client handler: ", msg);
+				}
 			} finally {
 				logout();
 			}
@@ -103,6 +110,7 @@ public final class Server {
 					case RegistrationRequest(String name, String passwd) -> register(name, passwd);
 					case AuthorisationRequest(String name, String passwd) -> authorise(name, passwd);
 					case GetNamesRequest() -> getNames();
+					case GetActiveUsersRequest() -> getActiveNames();
 					case GetDialogRequest(String with) -> handleDialog(with);
 					case GetMessagesRequest(User from, MessageSeenState state) -> handleGetMessages(from, state);
 					case SendMessageRequest(MessageContent content, String to) -> handleSend(content, to);
@@ -110,12 +118,11 @@ public final class Server {
 					case AuthPollRequest(String name, String passwd) -> handlePollInit(name, passwd);
 					case PollRequest() -> handlePoll();
 					case LogoutRequest() -> logout();
-					default -> logger.logError("Unexpected request type");
+					default -> logError("Unexpected request type");
 				}
 			} catch (Exception e) {
-				logger.logError("Unexpected error in client handler: ", e.getMessage());
+				logError("Unexpected error in client handler: ", e.getMessage());
 			}
-
 		}
 
 		/*Далее названия функций говорят сами за себя*/
@@ -141,16 +148,19 @@ public final class Server {
 		private void register(String name, String passwd) throws IOException {
 			var user = registerUser(name, passwd);
 			atomicSend(new AuthorisationResponse(user != null ? user.id() : -1));
-			if (user != null) authoriseAsClient(user);
+			if (user != null) {
+				authoriseAsClient(user);
+				logInfo("Registered: " + user);
+			}
 		}
 
 		private void authorise(String name, String passwd) throws IOException {
 			long userId = authoriseUser(name, passwd);
-			logger.logInfo("Authorised: " + (userId != -1 ? userId : "unknown"));
 			atomicSend(new AuthorisationResponse(userId));
 			if (userId != -1) {
-				logger.logInfo("User authorised: " + name);
-				authoriseAsClient(new User(userId, name));
+				var user = new User(userId, name);
+				authoriseAsClient(user);
+				logInfo("Authorised: " + user);
 			}
 		}
 
@@ -162,13 +172,28 @@ public final class Server {
 			try {
 				atomicSend(
 						new GetNamesResponse(
-								UserDAO.getAllExcept(client.id()).stream().map(User::name).toList()
+								getUsers(client.id())
 						)
 				);
 			} catch (SQLException e) {
-				logger.logError("Couldn't get users", e.getMessage());
+				logError("Couldn't get users", e.getMessage());
 			}
-			logger.logInfo(client + " got active names");
+			logInfo(client + " got active names");
+		}
+
+		private void getActiveNames() throws IOException {
+			if (!authorised) {
+				sendError("Error: User not authorised");
+				return;
+			}
+			try {
+				atomicSend(
+						new GetActiveUsersResponse(
+								getClientsNamesExcept(client)
+						)
+				);
+			} catch (IOException ignored) {
+			}
 		}
 
 		private void handleDialog(String with) throws IOException {
@@ -200,7 +225,7 @@ public final class Server {
 			List<Message> messages = getMessages(from, client, state);
 			if(messages == null) {
 				sendError("Error: No messages found");
-				logger.logError("Couldn't get messages " + client,
+				logError("Couldn't get messages " + client,
 						"Someones id is null");
 				return;
 			}
@@ -258,7 +283,7 @@ public final class Server {
 			long userId = authoriseUser(name, passwd);
 			atomicSend(new AuthPollResponse(userId != -1));
 			if (userId != -1) {
-				logger.logInfo("Poller authorised: " + name);
+				logInfo("Poller authorised: " + name);
 				authoriseAsPoller(new User(userId, name));
 			}
 		}
@@ -273,7 +298,7 @@ public final class Server {
 				BlockingQueue<Message> senderQueue = messageQueues.get(updated.from());
 				if (senderQueue != null) {
 					if(!senderQueue.offer(updated))
-						logger.logError("SenderQueue error");
+						logError("SenderQueue error");
 					atomicSend(new InfoMessage("Message marked as seen"));
 					var chatter = activePollers.stream().filter(
 							cl -> cl.client.name().equals(updated.from())
@@ -297,23 +322,38 @@ public final class Server {
 			if (client != null) {
 				authorised = false;
 				removeQueueForUser(client);
-				activeClients.remove(this);
-				activePollers.remove(this);
-				logger.logInfo("Disconnected: " + client.name());
+				if (activeClients.contains(this)) {
+					activeClients.remove(this);
+					activePollers.stream()
+							.filter(p -> this.client.equals(p.getUser()))
+							.findFirst()
+							.ifPresent(p -> {
+								activePollers.remove(p);
+								p.logout();
+							});
+				} else
+					activePollers.remove(this);
+
+
+				try {
+					sendToAllPollers(new ClientLogoutResponse(client.name()));
+				} catch (IOException ignored) {
+				}
+				logInfo("Disconnected: " + client.name());
 			}
 		}
 
 		public void sendError(String err) throws IOException {
-			logger.logError("Err message sent to " + client + " " + err);
+			logError("Err message sent to " + client + " " + err);
 			atomicSend(new ErrorMessage(err));
 		}
 
 		public void sendInfo(String info) throws IOException {
-			logger.logInfo("Info message sent to " + client + " " + info);
+			logInfo("Info message sent to " + client + " " + info);
 			atomicSend(new InfoMessage(info));
 		}
 
-		public User getClient() {
+		public User getUser() {
 			return this.client;
 		}
 
@@ -321,6 +361,11 @@ public final class Server {
 			if (user != null) {
 				client = user;
 				authorised = true;
+
+				try {
+					sendToAllPollers(new GetActiveUsersResponse(List.of(user.name())));
+				} catch (IOException ignored) {
+				}
 
 				activeClients.add(this);
 			}
@@ -339,13 +384,41 @@ public final class Server {
 		public void sendMarkResponse(MarkAsSeenResponse markAsSeenResponse){
 			if(!clientSocket.isClosed() && out != null){
 				try {
-					logger.logInfo("Mark as seen response send: " + markAsSeenResponse);
+					logInfo("Mark as seen response send: " + markAsSeenResponse);
 					atomicSendToPoller(markAsSeenResponse);
 				} catch (Exception e) {
-					logger.logError("Couldn't send mark response to " + client, e.getMessage());
+					logError("Couldn't send mark response to " + client, e.getMessage());
 				}
 			}
 		}
+	}
+
+	private void sendToAllPollers(Object message) throws IOException {
+		synchronized (activePollers) {
+			for (var poller : activePollers) {
+				poller.atomicSend(message);
+			}
+		}
+	}
+
+	private Map<String, Boolean> getUsers(long userId) throws SQLException {
+		var res = new HashMap<String, Boolean>();
+		var users = UserDAO.getAllExcept(userId);
+		for (User user : users) {
+			res.put(user.name(), activeClients.stream().anyMatch(cl -> cl.getUser().equals(user)));
+		}
+		return res;
+	}
+
+	private List<String> getClientsNamesExcept(User user) {
+		List<String> names = new ArrayList<>();
+		synchronized (activeClients) {
+			for (var client : activeClients) {
+				if (!client.client.equals(user))
+					names.add(client.getUser().name());
+			}
+		}
+		return names;
 	}
 
 	public Server(){
@@ -358,11 +431,11 @@ public final class Server {
 	/**Запуск сервера на порту port*/
 	public boolean start(int port){
 		if (running) {
-			logger.logInfo("Server is already running");
+			logInfo("Server is already running");
 			return false;
 		}
 		if (corrupted) {
-			logger.logError("Server is corrupted");
+			logError("Server is corrupted");
 			return false;
 		}
 		try{
@@ -371,7 +444,7 @@ public final class Server {
 			serverSocket = new ServerSocket(port);
 
 			running = true;
-			logger.logInfo("Server started on port: " + port);
+			logInfo("Server started on port: " + port);
 			virtualThreadExecutor.submit(() -> {
 				while (running && !serverSocket.isClosed()) {
 					try {
@@ -379,27 +452,20 @@ public final class Server {
 						virtualThreadExecutor.submit(ch);
 					} catch (SocketException e) {
 						if (running) {
-							logger.logError("Socket closed unexpectedly", e.getMessage());
+							logError("Socket closed unexpectedly", e.getMessage());
 						}
 						break;
 					} catch (IOException e) {
-						logger.logError("Couldn't accept new client.\nUnexpected error occurred", e.getMessage());
+						logError("Couldn't accept new client.\nUnexpected error occurred", e.getMessage());
 					}
 				}
 			});
 			return true;
 
 		} catch (IOException | SQLException e){
-			logger.logError("Couldn't start server on port: " + port + ".\nUnexpected error occurred", e.getMessage());
+			logError("Couldn't start server on port: " + port + ".\nUnexpected error occurred", e.getMessage());
 			return false;
 		}
-	}
-
-
-
-	/**Запуск на порту 43500*/
-	public boolean start(){
-		return start(BASIC_PORT);
 	}
 
 	/**Подключение к БД*/
@@ -407,9 +473,9 @@ public final class Server {
 		corrupted = false;
 		try {
 			DAO_Conf.getConnection();
-			logger.logInfo("DB connected");
+			logInfo("DB connected");
 		} catch (SQLException e) {
-			logger.logError("Couldn't connect to DB" + ".\nUnexpected error occurred", e.getMessage());
+			logError("Couldn't connect to DB" + ".\nUnexpected error occurred", e.getMessage());
 			corrupted = true;
 		}
 	}
@@ -426,7 +492,7 @@ public final class Server {
 			try {
 				client.sendInfo("Server is closing");
 			} catch (IOException e) {
-				logger.logError("Server closing: Error occurred when sending info message", e.getMessage());
+				logError("Server closing: Error occurred when sending info message", e.getMessage());
 			}
 			client.logout();
 		}
@@ -438,7 +504,7 @@ public final class Server {
 		try {
 			serverSocket.close();
 		} catch (IOException e) {
-			logger.logError("Couldn't stop server.\nUnexpected error occurred", e.getMessage());
+			logError("Couldn't stop server.\nUnexpected error occurred", e.getMessage());
 			return false;
 		}
 
@@ -468,7 +534,7 @@ public final class Server {
 	private void registerServer(int port) throws SQLException {
 		var users = ServerDAO.register(getLocalIpAddress(), port);
 		for(var user : users){
-			logger.logInfo("Fetched user: " + user);
+			logInfo("Fetched user: " + user);
 		}
 	}
 
@@ -487,11 +553,11 @@ public final class Server {
 		try{
 			var user = UserDAO.insert(name, passwd);
 			if(user != null){
-				logger.logInfo("New user registered " + user.name());
+				logInfo("New user registered " + user.name());
 			}
 			return user;
 		}catch (SQLException e) {
-			logger.logError("Couldn't register user " + name + ".\nUnexpected error occurred", e.getMessage());
+			logError("Couldn't register user " + name + ".\nUnexpected error occurred", e.getMessage());
 		}
 		return null;
 	}
@@ -504,7 +570,7 @@ public final class Server {
 			return -1;
 
 		}catch (SQLException e) {
-			logger.logError("Couldn't authorise user " + name + ".\nUnexpected error occurred", e.getMessage());
+			logError("Couldn't authorise user " + name + ".\nUnexpected error occurred", e.getMessage());
 		}
 		return -1;
 	}
@@ -513,9 +579,9 @@ public final class Server {
 		List<Message> resultList = new ArrayList<>();
 		try {
 			resultList = MessageDAO.getMessages(from, to, state);
-			logger.logInfo("Messages get from " +  from.name() + " to " + to.name());
+			logInfo("Messages get from " + from.name() + " to " + to.name());
 		} catch (SQLException e) {
-			logger.logError("Couldn't get messages sent to user " + to.name() + ".\nUnexpected error occurred", e.getMessage());
+			logError("Couldn't get messages sent to user " + to.name() + ".\nUnexpected error occurred", e.getMessage());
 		}
 		return resultList;
 	}
@@ -532,14 +598,14 @@ public final class Server {
 		var recipient = msg.to();
 		if (recipient == null) {
 			for (ClientHandler ch : activeClients) {
-				User u = ch.getClient();
+				User u = ch.getUser();
 				if (u != null && !u.name().equals(msg.from())) {
 					BlockingQueue<Message> q = messageQueues.get(u.name());
 					if (q != null) {
 						if(!q.offer(msg))
-							logger.logError("Couldn't offer a message");
+							logError("Couldn't offer a message");
 						else
-							logger.logInfo("Messages get with id " + msg.messageId() +
+							logInfo("Messages get with id " + msg.messageId() +
 									"from" + (msg.from() == null ? "(all) " : msg.from()) +
 									" to " + (msg.to() == null ? "(all) " : msg.from()));
 					}
@@ -549,7 +615,7 @@ public final class Server {
 			BlockingQueue<Message> q = messageQueues.get(recipient);
 			if (q != null)
 				if(!q.offer(msg))
-					logger.logError("Couldn't offer a message");
+					logError("Couldn't offer a message");
 		}
 	}
 
@@ -588,7 +654,7 @@ public final class Server {
 			return messagesId;
 		}
 		catch (SQLException e) {
-			logger.logError("Couldn't send message from " + from
+			logError("Couldn't send message from " + from
 					+ " to " + (to == null ? "(broadcast)" : to)
 					+ ".\nUnexpected error occurred", e.getMessage());
 		}
@@ -599,7 +665,7 @@ public final class Server {
 		try {
 			return MessageDAO.markMessageAsSeen(messageId);
 		} catch (SQLException e) {
-			logger.logError("Could not mark message as seen [id: "+ messageId +" ]", e.getMessage());
+			logError("Could not mark message as seen [id: " + messageId + " ]", e.getMessage());
 			return null;
 		}
 	}
@@ -608,12 +674,31 @@ public final class Server {
 		List<Message> result = new ArrayList<>();
 		try {
 			result = MessageDAO.getDialog(first.id(), second.id());
-			logger.logInfo("User " + first +"get dialog with " + second);
+			logInfo("User " + first + "get dialog with " + second);
 		} catch (SQLException e) {
-			logger.logError("Couldn't get dialog between " + first + " and " + second, e.getMessage());
+			logError("Couldn't get dialog between " + first + " and " + second, e.getMessage());
 		}
 		return result;
 	}
+
+	private void logError(String msg, String e) {
+		logger.logError(msg, e);
+		if (verbose)
+			System.out.println(logger.getLastLog());
+	}
+
+	private void logError(String msg) {
+		logger.logError(msg);
+		if (verbose)
+			System.out.println(logger.getLastLog());
+	}
+
+	private void logInfo(String msg) {
+		logger.logInfo(msg);
+		if (verbose)
+			System.out.println(logger.getLastLog());
+	}
+	
 
 	/**Точка входа
 	 * поддерживаются команды для консольного вызова
@@ -621,12 +706,13 @@ public final class Server {
 	 * Флаги:
 	 * -p {число} порт, на котором запустится сервер (-s не обязателен)
 	 * -s флаг для запуска сервера
+	 * -v сразу выводит логи при получении
 	 * Вызов меню управления сервером*/
 
 	static void main(String[] args){
 		Server server = new Server();
 		Scanner scanner = new Scanner(System.in);
-		int choice;
+		String input;
 
 		int port = 43500;
 
@@ -639,7 +725,9 @@ public final class Server {
 					break;
 				case "-s":
 					autoStart = true;
-
+					break;
+				case "-v"://можно добавить ещё флаги, какие именно типы логов будут высвечиваться
+					server.verbose = true;
 					break;
 			}
 		}
@@ -647,63 +735,125 @@ public final class Server {
 		if(autoStart){
 			server.start(port);
 		}
-		//TODO переписать консоль сервера под команды
+
 		do {
 
-			System.out.println("-SERVER MENU-");
-			System.out.println("1. Start");
-			System.out.println("2. Start on port");
-			System.out.println("3. Stop");
-			System.out.println("4. Show logs");
-			System.out.println("5. Clear logs");
-			System.out.println("0. Ext");
-			System.out.print("Act: ");
+			input = scanner.nextLine().trim();
 
-			while (!scanner.hasNextInt()) {
-				System.out.print("Input must be integer");
-				scanner.next();
-			}
-			choice = scanner.nextInt();
-
-			switch (choice) {
-				case 1:
-					if(server.start())
-						System.out.println("Server stared successfully");
-					break;
-				case 2:
-					while (!scanner.hasNextInt()) {
-						System.out.print("Input must be integer");
-						scanner.next();
-					}
-					port = scanner.nextInt();
-					if(server.start(port))
-						System.out.println("Server stared successfully");
-					break;
-				case 3:
-					if(server.stop())
-						System.out.println("Server stopped successfully");
-					break;
-				case 4:
-					System.out.println("-=LOGS=-");
-					System.out.println(server.showLogs());
-					break;
-				case 5:
-					server.clearLogs();
-					System.out.println("Cleared");
-					break;
-				case 6:
-					server.logger.clearInfo();
-					break;
-				case 7:
-					server.logger.clearErrors();
-					break;
-				case 0:
-					server.stop();
-					scanner.close();
-					return;
-				default:
-					System.out.println("Invalid choice");
-					break;
+			if (input.charAt(0) != '/') {
+				System.out.println("Command must start with '/'");
+			} else {
+				input = input.substring(1);
+				String[] commands = input.split("\\s+");
+				switch (commands[0]) {
+					case "start":
+						port = Server.BASIC_PORT;
+						if (commands.length == 2) {
+							try {
+								port = Integer.parseInt(commands[1]);
+							} catch (NumberFormatException ignored) {
+								System.out.println("Port must be an integer");
+							}
+						}
+						if (server.start(port))
+							System.out.println("Server started");
+						else
+							System.out.println("Could not start server");
+						break;
+					case "stop":
+						if (server.stop())
+							System.out.println("Server stopped");
+						else
+							System.out.println("Could not stop server");
+						break;
+					case "logs":
+						if (commands.length == 1) {
+							System.out.println("/logs show/clear");
+							break;
+						}
+						switch (commands[1]) {
+							case "clear":
+								switch (commands.length) {
+									case 2:
+										server.clearLogs();
+										server.logInfo("Logs cleared");
+										System.out.println("Logs cleared");
+										break;
+									case 3:
+										switch (commands[2]) {
+											case "all":
+												server.clearLogs();
+												server.logInfo("Logs cleared");
+												System.out.println("Logs cleared");
+												break;
+											case "info":
+												server.logger.clearInfo();
+												server.logInfo("Info logs cleared");
+												System.out.println("Info logs cleared");
+												break;
+											case "error":
+											case "err":
+												server.logger.clearErrors();
+												server.logInfo("Error logs cleared");
+												System.out.println("Error logs cleared");
+												break;
+										}
+								}
+								break;
+							case "show":
+								switch (commands.length) {
+									case 2:
+										System.out.println("-=LOGS=-");
+										System.out.println(server.showLogs());
+										break;
+									case 3:
+										switch (commands[2]) {
+											case "all":
+												System.out.println("-=LOGS=-");
+												System.out.println(server.showLogs());
+												break;
+											case "info":
+												System.out.println("-=LOGS=-");
+												System.out.println(server.logger.showInfoLogs());
+												break;
+											case "error":
+											case "err":
+												System.out.println("-=LOGS=-");
+												System.out.println(server.logger.showErrorLogs());
+												break;
+										}
+								}
+								break;
+						}
+						break;
+					case "exit":
+						server.stop();
+						scanner.close();
+						return;
+					case "help":
+						System.out.println("""
+								/help - see this list
+								/start [port] - start server on port. Basic port is 43500
+								/stop - stop the server
+								/logs {show/clear} [all/info/err]
+								""");
+						break;
+					case "clear":
+						try {
+							String os = System.getProperty("os.name").toLowerCase();
+							if (os.contains("win")) {
+								new ProcessBuilder("cmd", "/c", "cls").inheritIO().start().waitFor();
+							} else {
+								System.out.print("\033[H\033[2J");
+								System.out.flush();
+							}
+						} catch (Exception ignored) {
+						}
+						break;
+					default:
+						System.out.println("Invalid command. Try /help");
+						break;
+				}
 			}
 			System.out.print("\n");
 		} while (true);

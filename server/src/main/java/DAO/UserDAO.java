@@ -119,6 +119,8 @@ public class UserDAO {
 				from users
 				where
 				    serverid = ?
+				order by
+				    username desc
 				""";
 
 		try (PreparedStatement stmt = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
@@ -144,6 +146,8 @@ public class UserDAO {
 				where
 				    serverid = ? and
 				    userid != ?
+				order by
+				    username desc
 				""";
 
 		try (PreparedStatement stmt = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {

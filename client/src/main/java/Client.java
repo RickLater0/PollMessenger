@@ -15,12 +15,14 @@ import java.net.Socket;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.Map;
 import java.util.Scanner;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
 
-public final class Client {
+public final class Client implements AutoCloseable {
 	private final Socket socket;
 	private final ObjectInputStream in;
 	private final ObjectOutputStream out;
@@ -33,8 +35,8 @@ public final class Client {
 
 	private final Thread listenThread;
 
-	//TODO создать коллекцию для хранения кешированных пользователей. Использовать её при открытии чата и других взаимодействиях
-	// с другими пользователями
+	/// /пользователь - он/офлайн
+	private final Map<String, Boolean> users = new ConcurrentHashMap<>();
 
 	private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm:ss");
 
@@ -44,17 +46,19 @@ public final class Client {
 
 	private final BlockingQueue<Object> incomingResponses = new LinkedBlockingQueue<>();
 
-	List<Message> currentDialogue = new CopyOnWriteArrayList<>();
+	private final List<Message> currentDialogue = new CopyOnWriteArrayList<>();
 
 	public Client(String address, int port) throws IOException {
 
 		socket = new Socket(address, port);
 		pollSocket = new Socket(address, port);
-		in = new ObjectInputStream(socket.getInputStream());
 		out = new ObjectOutputStream(socket.getOutputStream());
+		out.flush();
+		in = new ObjectInputStream(socket.getInputStream());
 
-		pollIn = new ObjectInputStream(pollSocket.getInputStream());
 		pollOut = new ObjectOutputStream(pollSocket.getOutputStream());
+		pollOut.flush();
+		pollIn = new ObjectInputStream(pollSocket.getInputStream());
 
 		Runtime.getRuntime().addShutdownHook(new Thread(this::close));
 		listenThread = new Thread(this::listening);
@@ -87,46 +91,88 @@ public final class Client {
 	void logout() {
 		try {
 			sendAsync(new LogoutRequest());
-			poller.logout();
 			currentUser = null;
 			chatPartner = null;
+			if (poller != null) {
+				poller.interrupt();
+			}
 			System.out.println("Logged out.");
 		} catch (IOException e) {
 			logger.logError("Error:", e.getMessage());
 		}
 	}
 
+	@Override
 	public void close() {
+		if (!running)
+			return;
 		running = false;
 		try {
 			if (socket != null && !socket.isClosed()) {
-				sendAsync(new LogoutRequest());
-				in.close();
-				out.close();
-				socket.close();
-				if (pollSocket != null && !pollSocket.isClosed()) {
-					pollOut.close();
-					pollIn.close();
-					pollSocket.close();
+				try {
+					sendAsync(new LogoutRequest());
+				} catch (IOException ignored) {
 				}
-				listenThread.interrupt();
-				System.out.println(logger.showLogs());
 			}
-		} catch (IOException ignored) {
+
+			if (poller != null) {
+				poller.interrupt();
+			}
+
+			// Сначала закрываем сокеты — это мгновенно разблокирует все висящие readObject()
+			if (socket != null) try {
+				socket.close();
+			} catch (IOException ignored) {
+			}
+			if (pollSocket != null) try {
+				pollSocket.close();
+			} catch (IOException ignored) {
+			}
+
+			// Затем закрываем сами потоки данных
+			if (in != null) try {
+				in.close();
+			} catch (IOException ignored) {
+			}
+			if (out != null) try {
+				out.close();
+			} catch (IOException ignored) {
+			}
+			if (pollIn != null) try {
+				pollIn.close();
+			} catch (IOException ignored) {
+			}
+			if (pollOut != null) try {
+				pollOut.close();
+			} catch (IOException ignored) {
+			}
+
+			users.clear();
+			currentDialogue.clear();
+			if (listenThread != null) listenThread.interrupt();
+
+			clearConsole();
+			System.out.println("Client resource cleanup completed.");
+			System.out.println(logger.showLogs());
+		} catch (Exception ignored) {
 		}
 	}
 
 	private Object sendAndWait(Object request) throws IOException, InterruptedException {
-		out.writeObject(request);
-		out.flush();
+		synchronized (out) {
+			out.writeObject(request);
+			out.flush();
+		}
 		var resp = incomingResponses.take();
 		logger.logInfo("Sync response - " + resp.getClass().getSimpleName());
 		return resp;
 	}
 
 	private void sendAsync(Object request) throws IOException {
-		out.writeObject(request);
-		out.flush();
+		synchronized (out) {
+			out.writeObject(request);
+			out.flush();
+		}
 	}
 
 	private boolean register(String name, String password) throws IOException, InterruptedException {
@@ -148,9 +194,16 @@ public final class Client {
 	 * автоматически отмечаются как прочитанные и выводятся.
 	 */
 	private class Poller extends Thread {
+
+		private void atomicPoll(Object request) throws IOException {
+			synchronized (pollOut) {
+				pollOut.writeObject(request);
+				pollOut.flush();
+			}
+		}
+
 		private boolean authPoll(String name, String password) throws IOException {
-			pollOut.writeObject(new AuthPollRequest(name, password));
-			pollOut.flush();
+			atomicPoll(new AuthPollRequest(name, password));
 			Object resp = null;
 			try {
 				resp = pollIn.readObject();
@@ -170,8 +223,7 @@ public final class Client {
 				while (running && !pollSocket.isClosed()) {
 					if (currentUser == null)
 						break;
-					pollOut.writeObject(new PollRequest());
-					pollOut.flush();
+					atomicPoll(new PollRequest());
 					Object response = pollIn.readObject();
 					handlePollResponse(response);
 				}
@@ -182,69 +234,77 @@ public final class Client {
 
 		private void handlePollResponse(Object response) {
 			switch (response) {
-				case GetMessagesResponse(List<Message> messages) -> {
-					for (Message msg : messages) {
-						if (msg == null) {
-							logger.logError("Incoming message is null!");
-							continue;
-						}
-						if (chatPartner != null && chatPartner.equals(msg.from())) {
-							currentDialogue.add(msg);
-							try {
-								sendAsync(new MarkAsSeenRequest(msg.messageId()));
-							} catch (IOException ignored) {
-							}
-							msg.setSeenTime(LocalDateTime.now());
-							redrawChatScreen();
-						} else if (chatPartner == null && (msg.to() == null || msg.to().equals(currentUser.name()))) {
-							System.out.print("\n[New from " + msg.from() + "]: " + msg.content().content());
-							System.out.print("\n> ");
-						}
-					}
-				}
-				case SendMessageResponse(long realId) -> {
-					if (chatPartner != null) {
-						Message toRemove = null;
-						for (Message msg : currentDialogue) {
-							if (msg.messageId() < 0 && msg.from().equals(currentUser.name()) && (msg.to() == null || msg.to().equals(chatPartner))) {
-								toRemove = msg;
-								break;
-							}
-						}
-						if (toRemove != null) {
-							currentDialogue.remove(toRemove);
-							currentDialogue.add(new Message(realId, toRemove.content(), toRemove.from(), toRemove.to(),
-									toRemove.dispatchTime(), toRemove.seenTime()));
-							redrawChatScreen();
-						}
-					}
-				}
-				case MarkAsSeenResponse(long msgId, LocalDateTime seenTime) -> {
-					for (Message msg : currentDialogue) {
-						if (msg.from().equals(currentUser.name()) && msg.messageId() == msgId) {
-							msg.setSeenTime(seenTime);
-							redrawChatScreen();
-							break;
-						}
-					}
-				}
+				case GetMessagesResponse(List<Message> messages) -> handleGetMessages(messages);
+				case SendMessageResponse(long realId) -> handleSendMessage(realId);
+				case MarkAsSeenResponse(long msgId, LocalDateTime seenTime) -> handleMarkAsSeen(msgId, seenTime);
+				case ClientLogoutResponse(String username) -> handleOtherClientLogout(username);
+				case GetActiveUsersResponse(List<String> usernames) -> handleGetActiveUsers(usernames);
 				case InfoMessage(String msg) -> logger.logInfo("Server Poll: " + msg);
 				case ErrorMessage(String msg) -> logger.logError("Server Poll Error: " + msg);
 				default -> logger.logError("Unexpected poll response: " + response);
 			}
 		}
 
-		public void logout() {
-			try {
-				pollOut.writeObject(new LogoutRequest());
-				pollOut.flush();
-			} catch (IOException e) {
-				logger.logError("Poller Error:", e.getMessage());
+		private void handleGetMessages(List<Message> messages) {
+			for (Message msg : messages) {
+				if (msg == null) {
+					logger.logError("Incoming message is null!");
+					continue;
+				}
+				if (chatPartner != null && chatPartner.equals(msg.from())) {
+					currentDialogue.add(msg);
+					try {
+						sendAsync(new MarkAsSeenRequest(msg.messageId()));
+					} catch (IOException ignored) {
+					}
+					msg.setSeenTime(LocalDateTime.now());
+					redrawChatScreen();
+				} else if (chatPartner == null && (msg.to() == null || msg.to().equals(currentUser.name()))) {
+					System.out.print("\n[New from " + msg.from() + "]: " + msg.content().content());
+					System.out.print("\n> ");
+				}
+			}
+		}
+
+		private void handleSendMessage(long realId) {
+			if (chatPartner != null) {
+				Message toRemove = null;
+				for (Message msg : currentDialogue) {
+					if (msg.messageId() < 0 && msg.from().equals(currentUser.name()) && (msg.to() == null || msg.to().equals(chatPartner))) {
+						toRemove = msg;
+						break;
+					}
+				}
+				if (toRemove != null) {
+					currentDialogue.remove(toRemove);
+					currentDialogue.add(new Message(realId, toRemove.content(), toRemove.from(), toRemove.to(),
+							toRemove.dispatchTime(), toRemove.seenTime()));
+					redrawChatScreen();
+				}
+			}
+		}
+
+		private void handleMarkAsSeen(long msgId, LocalDateTime seenTime) {
+			for (Message msg : currentDialogue) {
+				if (msg.from().equals(currentUser.name()) && msg.messageId() == msgId) {
+					msg.setSeenTime(seenTime);
+					redrawChatScreen();
+				}
+			}
+		}
+
+		private void handleOtherClientLogout(String username) {
+			users.put(username, false);
+		}
+
+		private void handleGetActiveUsers(List<String> usernames) {
+			for (String username : usernames) {
+				users.put(username, true);
 			}
 		}
 	}
 
-	Poller poller = new Poller();
+	private volatile Poller poller = null;
 
 	/**
 	 * Авторизация существующего пользователя.
@@ -254,12 +314,15 @@ public final class Client {
 	private boolean login(String name, String password) throws IOException, InterruptedException {
 		Object resp = sendAndWait(new AuthorisationRequest(name, password));
 		if (resp instanceof AuthorisationResponse(Long userId) && userId != -1) {
+
+			poller = new Poller();
+
 			if (poller.authPoll(name, password)) {
 				currentUser = new User(userId, name);
 				System.out.println("Login successful as " + name);
 				System.out.println("Welcome to Messenger!");
 				System.out.println("Print /help to see commands");
-				showActiveUsers();
+				showUsers();
 				poller.setDaemon(true);
 				poller.start();
 				return true;
@@ -272,19 +335,24 @@ public final class Client {
 	/**
 	 * Получить и вывести список активных пользователей (кроме себя).
 	 */
-	private void showActiveUsers() throws IOException, InterruptedException {
-		Object resp = sendAndWait(new GetNamesRequest());
-		if (resp instanceof GetNamesResponse(List<String> users)) {
-			if (users.isEmpty()) {
-				System.out.println("No other active users.");
-			} else {
-				System.out.println("Active users:");
-				for (int i = 0; i < users.size(); i++) {
-					System.out.println((i + 1) + ". " + users.get(i));
+	private void showUsers() throws IOException, InterruptedException {
+		if (users.isEmpty()) {
+			Object resp = sendAndWait(new GetNamesRequest());
+			if (resp instanceof GetNamesResponse(Map<String, Boolean> usersGot)) {
+				synchronized (users) {
+					users.putAll(usersGot);
 				}
+			} else if (resp instanceof ErrorMessage(String message)) {
+				logger.logError(message);
 			}
-		} else if (resp instanceof ErrorMessage(String message)) {
-			logger.logError(message);
+		}
+		if (users.isEmpty()) {
+			System.out.println("No other users.");
+		} else {
+			System.out.println("Users:");
+			for (var entry : users.entrySet()) {
+				System.out.println(entry.getKey() + "\t" + (entry.getValue() ? "[Y]" : "[N]"));
+			}
 		}
 	}
 
@@ -302,8 +370,8 @@ public final class Client {
 		Object resp = sendAndWait(new GetDialogRequest(with));
 		if (resp instanceof GetMessagesResponse(List<Message> dialog)) {
 			if (dialog == null) {
-				System.out.println("No messages found. Probably a typo in username");
 				logger.logInfo("No messages found. Probably a typo in username");
+				System.out.println(logger.getLastLog());
 				return;
 			}
 			currentDialogue.clear();
@@ -392,8 +460,22 @@ public final class Client {
 				""";
 	}
 
-	//TODO переписать это спагетти к чертям
-	//// консоль спагетти
+	//TODO переписать консольный UI
+
+	private void clearConsole() {
+		try {
+			String os = System.getProperty("os.name").toLowerCase();
+			if (os.contains("win")) {
+				new ProcessBuilder("cmd", "/c", "cls").inheritIO().start().waitFor();
+			} else {
+				System.out.print("\033[H\033[2J");
+				System.out.flush();
+			}
+		} catch (Exception e) {
+			// ignore
+		}
+	}
+
 	private void console() {
 		Scanner scanner = new Scanner(System.in);
 		boolean exit = false;
@@ -441,7 +523,7 @@ public final class Client {
 					input = scanner.nextLine().trim();
 					if (input.startsWith("/users")) {
 						try {
-							showActiveUsers();
+							showUsers();
 						} catch (Exception e) {
 							logger.logError("Error:", e.getMessage());
 						}
@@ -487,9 +569,9 @@ public final class Client {
 					input = scanner.nextLine().trim();
 					if (input.equals("/exit")) {
 						exitChat();
-					} else if(input.equals("/help")){
+					} else if (input.equals("/help")) {
 						System.out.println(getHelp());
-					}else if (!input.isEmpty()) {
+					} else if (!input.isEmpty()) {
 						try {
 							sendMessageToChat(input);
 						} catch (IOException e) {
@@ -501,20 +583,6 @@ public final class Client {
 		}
 		close();
 		scanner.close();
-	}
-
-	private void clearConsole() {
-		try {
-			String os = System.getProperty("os.name").toLowerCase();
-			if (os.contains("win")) {
-				new ProcessBuilder("cmd", "/c", "cls").inheritIO().start().waitFor();
-			} else {
-				System.out.print("\033[H\033[2J");
-				System.out.flush();
-			}
-		} catch (Exception e) {
-			// ignore
-		}
 	}
 
 	/**
@@ -583,8 +651,7 @@ public final class Client {
 			}
 		}
 
-		try {
-			Client client = new Client(host, port);
+		try (Client client = new Client(host, port)){
 			// Каша из логики флагов и выводов ошибок подключения
 			if (loginName != null && registerName == null && loginPassword != null) {
 				if (!client.login(loginName, loginPassword)) {

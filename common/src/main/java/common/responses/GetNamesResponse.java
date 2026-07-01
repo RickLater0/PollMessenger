@@ -1,7 +1,7 @@
 package common.responses;
 
 import java.io.Serializable;
-import java.util.List;
+import java.util.Map;
 
-public record GetNamesResponse(List<String> users) implements Serializable {
+public record GetNamesResponse(Map<String, Boolean> users) implements Serializable {
 }
