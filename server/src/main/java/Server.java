@@ -21,6 +21,7 @@ import java.sql.SQLException;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.locks.ReentrantLock;
 
 public final class Server {
 
@@ -72,6 +73,8 @@ public final class Server {
 
 		private final ObjectOutputStream out;
 		private final ObjectInputStream in;
+
+		private final ReentrantLock sendLock = new ReentrantLock();
 
 		public ClientHandler(Socket socket) throws IOException {
 			this.clientSocket = socket;
@@ -129,9 +132,13 @@ public final class Server {
 
 		void atomicSend(Object response) throws IOException {
 			if (!clientSocket.isClosed() && out != null) {
-				synchronized (out){
+				sendLock.lock(); //необязательно на java 24+, но в теории лучше будет так
+				// это +масштабируемость и +вайб
+				try {
 					out.writeObject(response);
 					out.flush();
+				} finally {
+					sendLock.unlock();
 				}
 			}
 		}
@@ -394,10 +401,8 @@ public final class Server {
 	}
 
 	private void sendToAllPollers(Object message) throws IOException {
-		synchronized (activePollers) {
-			for (var poller : activePollers) {
-				poller.atomicSend(message);
-			}
+		for (var poller : activePollers) {
+			poller.atomicSend(message);
 		}
 	}
 
@@ -412,11 +417,9 @@ public final class Server {
 
 	private List<String> getClientsNamesExcept(User user) {
 		List<String> names = new ArrayList<>();
-		synchronized (activeClients) {
-			for (var client : activeClients) {
-				if (!client.client.equals(user))
-					names.add(client.getUser().name());
-			}
+		for (var client : activeClients) {
+			if (!client.client.equals(user))
+				names.add(client.getUser().name());
 		}
 		return names;
 	}

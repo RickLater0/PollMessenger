@@ -362,7 +362,7 @@ public final class Client implements AutoCloseable {
 	 * - Отмечает все непрочитанные сообщения от этого пользователя как прочитанные.
 	 * - Переходит в режим чата (chatPartner = with).
 	 */
-	private void openChat(String with) throws IOException, InterruptedException {
+	public void openChat(String with) throws IOException, InterruptedException {
 		if (with.equals(currentUser.name())) {
 			logger.logInfo("You cannot chat with yourself.");
 			return;
@@ -393,7 +393,7 @@ public final class Client implements AutoCloseable {
 	/**
 	 * Отправить сообщение текущему собеседнику в чате.
 	 */
-	private void sendMessageToChat(String text) throws IOException {
+	public void sendMessageToChat(String text) throws IOException {
 		if (chatPartner == null) return;
 		long tempId = -System.currentTimeMillis();
 		Message tempMsg = new Message(tempId, new MessageContent(text), currentUser.name(), chatPartner, LocalDateTime.now());
@@ -405,7 +405,7 @@ public final class Client implements AutoCloseable {
 	/**
 	 * Отправить broadcast-сообщение всем пользователям.
 	 */
-	private void broadcast(String text) throws IOException {
+	public void broadcast(String text) throws IOException {
 		sendAsync(new SendMessageRequest(new MessageContent(text), null));
 		System.out.println("[Broadcast] " + text);
 	}
@@ -605,7 +605,6 @@ public final class Client implements AutoCloseable {
 		String loginName = null;
 		String registerName = null;
 		String loginPassword = null;
-
 		for (int i = 0; i < args.length; i++) {
 			switch (args[i]) {
 				case "-i":
