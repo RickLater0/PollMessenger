@@ -592,7 +592,7 @@ public final class Client implements AutoCloseable {
 	 * Флаги:
 	 * -i {ip:port} адрес сервера
 	 * -r логин для РЕГИСТРАЦИИ
-	 * -l логин для АВТОРИЗАЦИИ (-r и -l не быть существовать вместе)
+	 * -l логин для АВТОРИЗАЦИИ (-r и -l не могут существовать вместе)
 	 * -p пароль для входа
 	 * Далее - терминал управления клиентом
 	 * /help для помощи
@@ -672,5 +672,4 @@ public final class Client implements AutoCloseable {
 			System.err.println("Cannot connect to server: " + e.getMessage());
 		}
 	}
-
 }
